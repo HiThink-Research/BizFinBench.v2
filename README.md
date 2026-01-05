@@ -160,6 +160,5 @@ python run.py --config config/offical/eval_fin_eval_diamond.yaml --model_name ${
 License: Attribution-NonCommercial 4.0 International It should abide by the policy of OpenAI: https://openai.com/policies/terms-of-use
 
 ## 💖 Acknowledgement
-* We would like to thank [Weijie Zhang](https://github.com/zhangwj618) for his contribution to the development of the inference engine.
-* This work leverages [vLLM](https://github.com/vllm-project/vllm) as the backend model server for evaluation purposes.
+* TBD
 
