@@ -15,7 +15,7 @@
         </span>
         <br>
         <span class="author-block">
-            <sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,@shufe.edu.cn
+            <sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,zhang.liwen@shufe.edu.cn
         </span>
     </div>
   </p>
