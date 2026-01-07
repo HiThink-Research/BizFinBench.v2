@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">
-    <img src="static/logo.png" alt="BizFinBench logo" height="40" style="position:relative; top:6px;">
+    <!--<img src="static/logo.png" alt="BizFinBench logo" height="40" style="position:relative; top:6px;">-->
   BizFinBench.v2: A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment</h1>
     <p align="center">
     <span class="author-block">
