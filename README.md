@@ -73,7 +73,7 @@ Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd
 <div align="center">
 <img src="static/anomly_information_tracing.png" alt="Anomly Information Tracing" width="60%">
 </div>
-Others Coming Soon
+Others are Coming Soon
 
 ## 🛠️ Usage
 ### Install requirements
