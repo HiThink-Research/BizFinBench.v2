@@ -1,32 +1,31 @@
 <p align="center">
   <h1 align="center">
-    <!--<img src="static/logo.png" alt="BizFinBench logo" height="40" style="position:relative; top:6px;">-->
+    <img src="static/logo.png" alt="BizFinBench logo" height="40" style="position:relative; top:6px;">
   BizFinBench.v2: A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment</h1>
     <p align="center">
     <span class="author-block">
-      <!-- Xin Guo<sup>1,2,*</sup> </a>,</span>-->
+      Xin Guo<sup>1,2,*</sup> </a>,</span>
                 <span class="author-block">
-      <!--Rongjunchen Zhang<sup>1,*,♠</sup></a>, Guilong Lu<sup>1</sup>, Xuntao Guo<sup>1</sup>, Jia Shuai<sup>1</sup>, Zhi Yang<sup>2</sup>, Liwen Zhang<sup>2,♠</sup>-->
+      Rongjunchen Zhang<sup>1,*,♠</sup></a>, Guilong Lu<sup>1</sup>, Xuntao Guo<sup>1</sup>, Jia Shuai<sup>1</sup>, Zhi Yang<sup>2</sup>, Liwen Zhang<sup>2,♠</sup>
     </span>
     </div>
     <div class="is-size-5 publication-authors" style="margin-top: 10px;">
         <span class="author-block">
-            <!--<sup>1</sup>HiThink Research, <sup>2</sup>Shanghai University of Finance and Economics -->
+            <sup>1</sup>HiThink Research, <sup>2</sup>Shanghai University of Finance and Economics
         </span>
         <br>
         <span class="author-block">
-            <!--<sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,zhang.liwen@shufe.edu.cn -->
+            <sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,zhang.liwen@shufe.edu.cn
         </span>
     </div>
   </p>
   <p>
-  <!--📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="">Huggingface</a></h3>-->
+  📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="">Huggingface</a></h3>
   </p>
 <div align="center"></div>
 <p align="center">
 
-<!--**BizFinBench.v2** is the secend release of [BizFinBench](https://github.com/HiThink-Research/BizFinBench). It is built entirely on real-world user queries from Chinese and U.S. equity markets. It bridges the gap between academic evaluation and actual financial operations.-->
-**BizFinBench.v2** is the first large-scale evaluation benchmark for large language models that is based on authentic business data from the Chinese and U.S. stock markets and integrates online assessment. Addressing the limitations of existing benchmarks, such as distorted samples and narrow scenarios, BizFinBench.v2 constructs eight fundamental tasks and two online tasks across four core business scenarios by clustering real user queries from financial platforms, resulting in 29,578 expert-level question-answer pairs. Experimental results indicate that a significant performance gap remains between mainstream LLMs and financial experts in relevant tasks. Through error analysis, this benchmark identifies the specific capability deficiencies of current models, breaks through traditional limitations, and provides a precise foundation for evaluating the effectiveness of large-scale LLM deployment in the financial sector.
+**BizFinBench.v2** is the secend release of [BizFinBench](https://github.com/HiThink-Research/BizFinBench). It is built entirely on real-world user queries from Chinese and U.S. equity markets. It bridges the gap between academic evaluation and actual financial operations.
 
 <img src="static/score_sequence.png" alt="Evaluation Result">
 
@@ -40,8 +39,8 @@
 * **High Difficulty:** Even **ChatGPT-5** achieves only 61.5% accuracy on main tasks, highlighting a significant gap vs. human experts.
 * **Online Prowess:** **DeepSeek-R1** outperforms all other commercial LLMs in dynamic online tasks, achieving a total return of 13.46% with a maximum drawdown of -8%.
 
-<!--## 📢 News 
-- 🚀 [06/01/2026] TBD-->
+## 📢 News 
+- 🚀 [06/01/2026] TBD
 
 ## 📕 Data Distrubution
 BizFinBench.v2 contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
