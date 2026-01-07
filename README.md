@@ -44,11 +44,9 @@
 - 🚀 [06/01/2026] TBD-->
 
 ## 📕 Data Distrubution
-This dataset contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
+BizFinBench.v2 contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
 
-### 📊 Detailed Statistics of BizFinBench.v2 Data
-
-*Table: Details of BizFinBench.v2*
+### 📊 Detailed Statistics
 | Scenarios | Tasks | Avg. Input Tokens | # Questions |
 |:---|:---|---:|---:|
 | **Business Information Provenance** | Anomaly Information Tracing | 8,679 | 4,000 |
