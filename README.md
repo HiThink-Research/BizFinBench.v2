@@ -20,12 +20,13 @@
     </div>
   </p>
   <p>
-  📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="">Huggingface</a></h3>
+  <!--📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="">Huggingface</a></h3>-->
   </p>
 <div align="center"></div>
 <p align="center">
 
-**BizFinBench.v2** is the secend release of [BizFinBench](https://github.com/HiThink-Research/BizFinBench). It is built entirely on real-world user queries from Chinese and U.S. equity markets. It bridges the gap between academic evaluation and actual financial operations.
+<!--**BizFinBench.v2** is the secend release of [BizFinBench](https://github.com/HiThink-Research/BizFinBench). It is built entirely on real-world user queries from Chinese and U.S. equity markets. It bridges the gap between academic evaluation and actual financial operations.-->
+**BizFinBench.v2** is the first large-scale evaluation benchmark for large language models that is based on authentic business data from the Chinese and U.S. stock markets and integrates online assessment. Addressing the limitations of existing benchmarks, such as distorted samples and narrow scenarios, BizFinBench.v2 constructs eight fundamental tasks and two online tasks across four core business scenarios by clustering real user queries from financial platforms, resulting in 29,578 expert-level question-answer pairs. Experimental results indicate that a significant performance gap remains between mainstream LLMs and financial experts in relevant tasks. Through error analysis, this benchmark identifies the specific capability deficiencies of current models, breaks through traditional limitations, and provides a precise foundation for evaluating the effectiveness of large-scale LLM deployment in the financial sector.
 
 <img src="static/score_sequence.png" alt="Evaluation Result">
 
@@ -37,23 +38,39 @@
 
 ### 📊 Key Findings
 * **High Difficulty:** Even **ChatGPT-5** achieves only 61.5% accuracy on main tasks, highlighting a significant gap vs. human experts.
-* **Online Prowess:** **DeepSeek-R1** outperforms all other commercial LLMs in dynamic online tasks.
+* **Online Prowess:** **DeepSeek-R1** outperforms all other commercial LLMs in dynamic online tasks, achieving a total return of 13.46% with a maximum drawdown of -8%.
 
-## 📢 News 
-- 🚀 [06/01/2026] TBD
+<!--## 📢 News 
+- 🚀 [06/01/2026] TBD-->
 
 ## 📕 Data Distrubution
 This dataset contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
 
-<img src="static/distribution.png" alt="Data Distribution">
+### 📊 Detailed Statistics of BizFinBench.v2 Data
+
+*Table: Details of BizFinBench.v2*
+| Scenarios | Tasks | Avg. Input Tokens | # Questions |
+|:---|:---|---:|---:|
+| **Business Information Provenance** | Anomaly Information Tracing | 8,679 | 4,000 |
+| | Financial Multi-turn Perception | 10,361 | 3,741 |
+| | Financial Data Description | 3,577 | 3,837 |
+| **Financial Logic Reasoning** | Financial Quantitative Computation | 1,984 | 2,000 |
+| | Event Logic Reasoning | 437 | 4,000 |
+| | Counterfactual Inference | 2,267 | 2,000 |
+| **Stakeholder Feature Perception** | User Sentiment Analysis | 3,326 | 4,000 |
+| | Financial Report Analysis | 19,681 | 2,000 |
+| **Real-time Market Discernment** | Stock Price Prediction | 5,510 | 4,000 |
+| | Portfolio Asset Allocation | — | — |
+| **Total** | | **—** | **29,578** |
+
+
+<img src="static/distribution.png" alt="Data Distribution" width="60%">
 
 ## 📚 Example
 Coming Soon
 
 
 ## 🛠️ Usage
-Coming Soon
-
 ### Install requirements
 ```sh
 pip install -r requirements.txt
