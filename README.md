@@ -67,6 +67,10 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | | Portfolio Asset Allocation | — | — |
 | **Total** | | **—** | **29,578** |
 </div>
+
+### Data Download
+Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd/view?usp=drive_link">here</a> to download the data of BizFinBench.v2
+
 ## 📚 Example
 <div align="center">
 <img src="static/anomly_information_tracing.png" alt="Anomly Information Tracing" width="60%">
