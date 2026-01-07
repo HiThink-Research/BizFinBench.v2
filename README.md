@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">
     <img src="static/logo.png" alt="BizFinBench logo" height="40" style="position:relative; top:6px;">
-  BizFinBench.v2: A Unified Offline–Online Bilingual Benchmark for Expert-Level Financial Capability Evaluation of LLMs</h1>
+  BizFinBench.v2: A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment</h1>
     <p align="center">
     <span class="author-block">
       <!-- Xin Guo<sup>1,2,*</sup> </a>,</span>-->
@@ -47,7 +47,9 @@
 BizFinBench.v2 contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
 
 ### Distribution Visualization
-<img src="static/distribution.png" alt="Data Distribution" width="60%">
+<div align="center">
+    <img src="static/distribution.png" alt="Data Distribution" width="600">
+</div>
 
 ### Detailed Statistics
 | Scenarios | Tasks | Avg. Input Tokens | # Questions |
@@ -65,8 +67,8 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | **Total** | | **—** | **29,578** |
 
 ## 📚 Example
-Coming Soon
-
+<img src="static/anomly_information_tracing.png" alt="anomly_information_tracing" width="60%">
+Others Coming Soon
 
 ## 🛠️ Usage
 ### Install requirements
