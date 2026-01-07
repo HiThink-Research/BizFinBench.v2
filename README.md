@@ -52,7 +52,6 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 </div>
 
 ### Detailed Statistics
-<div align="center">
 | Scenarios | Tasks | Avg. Input Tokens | # Questions |
 |:---|:---|---:|---:|
 | **Business Information Provenance** | Anomaly Information Tracing | 8,679 | 4,000 |
@@ -66,7 +65,6 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | **Real-time Market Discernment** | Stock Price Prediction | 5,510 | 4,000 |
 | | Portfolio Asset Allocation | — | — |
 | **Total** | | **—** | **29,578** |
-</div>
 
 ### Data Download
 Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd/view?usp=drive_link">here</a> to download the data of BizFinBench.v2
