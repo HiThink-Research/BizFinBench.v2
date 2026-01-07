@@ -64,7 +64,7 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | | Financial Report Analysis | 19,681 | 2,000 |
 | **Real-time Market Discernment** | Stock Price Prediction | 5,510 | 4,000 |
 | | Portfolio Asset Allocation | — | — |
-| **Total** | | **—** | **29,578** |
+| **Total** | **—** | **—** | **29,578** |
 
 ### Data Download
 Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd/view?usp=drive_link">here</a> to download the data of BizFinBench.v2
