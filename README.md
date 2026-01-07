@@ -4,18 +4,18 @@
   BizFinBench.v2: A Unified Offline–Online Bilingual Benchmark for Expert-Level Financial Capability Evaluation of LLMs</h1>
     <p align="center">
     <span class="author-block">
-      Xin Guo<sup>1,2,*</sup> </a>,</span>
+      <!-- Xin Guo<sup>1,2,*</sup> </a>,</span>-->
                 <span class="author-block">
-      Rongjunchen Zhang<sup>1,*,♠</sup></a>, Guilong Lu<sup>1</sup>, Xuntao Guo<sup>1</sup>, Jia Shuai<sup>1</sup>, Zhi Yang<sup>2</sup>, Liwen Zhang<sup>2,♠</sup>
+      <!--Rongjunchen Zhang<sup>1,*,♠</sup></a>, Guilong Lu<sup>1</sup>, Xuntao Guo<sup>1</sup>, Jia Shuai<sup>1</sup>, Zhi Yang<sup>2</sup>, Liwen Zhang<sup>2,♠</sup>-->
     </span>
     </div>
     <div class="is-size-5 publication-authors" style="margin-top: 10px;">
         <span class="author-block">
-            <sup>1</sup>HiThink Research, <sup>2</sup>Shanghai University of Finance and Economics
+            <!--<sup>1</sup>HiThink Research, <sup>2</sup>Shanghai University of Finance and Economics -->
         </span>
         <br>
         <span class="author-block">
-            <sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,zhang.liwen@shufe.edu.cn
+            <!--<sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com,zhang.liwen@shufe.edu.cn -->
         </span>
     </div>
   </p>
