@@ -46,7 +46,10 @@
 ## 📕 Data Distrubution
 BizFinBench.v2 contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
 
-### 📊 Detailed Statistics
+### Distribution Visualization
+<img src="static/distribution.png" alt="Data Distribution" width="60%">
+
+### Detailed Statistics
 | Scenarios | Tasks | Avg. Input Tokens | # Questions |
 |:---|:---|---:|---:|
 | **Business Information Provenance** | Anomaly Information Tracing | 8,679 | 4,000 |
@@ -60,9 +63,6 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | **Real-time Market Discernment** | Stock Price Prediction | 5,510 | 4,000 |
 | | Portfolio Asset Allocation | — | — |
 | **Total** | | **—** | **29,578** |
-
-
-<img src="static/distribution.png" alt="Data Distribution" width="60%">
 
 ## 📚 Example
 Coming Soon
