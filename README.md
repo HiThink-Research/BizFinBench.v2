@@ -125,5 +125,5 @@ Coming Soon
 License: Attribution-NonCommercial 4.0 International It should abide by the policy of OpenAI: https://openai.com/policies/terms-of-use
 
 ## 💖 Acknowledgement
-* TBD
+* Special thanks to Ning Zhang, Siqi Wei, Kai Xiong, Kun Chen and colleagues at HiThink Research's data team for their support in building BizFinBench.v2.
 
