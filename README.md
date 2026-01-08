@@ -20,7 +20,7 @@
     </div>
   </p>
   <p>
-  📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="">Huggingface</a></h3>
+  📖<a href="">Paper</a> |🏠<a href="">Homepage</a></h3>|🤗<a href="https://huggingface.co/datasets/HiThink-Research/BizFinBench.v2">Huggingface</a></h3>
   </p>
 <div align="center"></div>
 <p align="center">
