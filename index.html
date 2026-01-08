@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="description"
+          content="BizFinBench.v2: A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment">
+    <meta name="keywords" content="Financial Benchmark, Large Language Models, LLM as a judge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BizFinBench</title> 
+
+    <script>
+        window.dataLayer = window.dataLayer || [];
+
+        function gtag() {
+            dataLayer.push(arguments);
+        }
+
+        gtag('js', new Date());
+
+        gtag('config', 'G-PYVRSFMDRL');
+    </script>
+
+    <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro"
+          rel="stylesheet">
+    <link rel="icon" href="./static/images/logo.png">
+    <link rel="stylesheet" href="./static/css/bulma.min.css">
+    <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
+    <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
+    <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+    <link rel="stylesheet" href="./static/css/index.css">
+
+    <link rel="stylesheet" href="./static/css/index-gradio.css">
+    <link rel="stylesheet" href="./static/css/live_theme.css">
+
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script defer src="./static/js/fontawesome.all.min.js"></script>
+    <script src="./static/js/bulma-carousel.min.js"></script>
+    <script src="./static/js/bulma-slider.min.js"></script>
+    <!-- <script src="./static/js/index.js"></script> -->
+</head>
+<body>
+
+
+<section class="hero">
+    <div class="hero-body">
+        <div class="container is-max-desktop">
+            <div class="columns is-centered">
+                <div class="column has-text-centered">
+                    <h1 class="title is-1 publication-title"
+                        style="display: flex;flex-direction: row;align-items: center;justify-content: center;margin-bottom: 5px;"><img
+                            src="./static/images/logo.png" width="60" height="60" style="margin-right: 10px;">BizFinBench.v2:</h1>
+                    <h1 class="title is-2 publication-title">A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment</h1>
+                    <div class="is-size-5 publication-authors">
+            <span class="author-block">
+              Xin Guo<sup>1,2,*</sup> </a>, </span>Rongjunchen Zhang<sup>1,*,♠</sup>, 
+                        <span class="author-block">
+              Guilong Lu<sup>1</sup></a>, Xuntao Guo<sup>1</sup>, Jia Shuai<sup>1</sup>, Zhi Yang<sup>2</sup>, Liwen Zhang<sup>2,♠</sup>
+            </span>
+                    </div>
+                    <div class="is-size-5 publication-authors" style="margin-top: 10px;">
+                        <span class="author-block">
+                            <sup>1</sup>Hithink Research, <sup>2</sup>Shanghai University of Finance and Economics
+                        </span>
+                        <br>
+                        <span class="author-block">
+                            <sup>*</sup>Co-first authors, <sup>♠</sup>Corresponding author, zhangrongjunchen@myhexin.com & zhang.liwen@shufe.edu.cn
+                        </span>
+                    </div>
+
+    </div>
+</section>
+
+<div class="column has-text-centered">
+    <div class="publication-links">
+      <!-- PDF Link. -->
+      <span class="link-block"> <a href=""
+           class="external-link button is-normal is-rounded is-dark"> <span class="icon"> <i class="ai ai-arxiv"></i> </span> <span>arXiv</span> </a> </span>
+      <!-- Code Link. -->
+      <span class="link-block"> <a href="https://github.com/HiThink-Research/BizFinBench.v2"
+           class="external-link button is-normal is-rounded is-dark"> <span class="icon"> <i class="fab fa-github"></i> </span> <span>Code</span> </a> </span>
+      <!-- HuggingFace Link. -->
+      <span class="link-block"> <a href=""
+           class="external-link button is-normal is-rounded is-dark"><span class="icon">🤗</span><span>Space</span> </a></span>
+    </div>
+      </div>
+
+
+
+<section class="section">
+    <div class="container is-max-desktop">
+        <!-- Abstract. -->
+        <div class="columns is-centered has-text-centered">
+            <div class="column is-four-fifths">
+                <h2 class="title is-2">Abstract</h2>
+                <div class="content has-text-justified">
+                    <p>
+                        Large language models have undergone rapid evolution, emerging as a pivotal technology for intelligence in financial operations. However, existing benchmarks are often constrained by pitfalls such as reliance on simulated or general-purpose samples and a focus on singular, offline static scenarios. Consequently, they fail to align with the requirements for authenticity and real-time responsiveness in financial services, leading to a significant discrepancy between benchmark performance and actual operational efficacy. To address this, we introduce BizFinBench.v2, the first large-scale evaluation benchmark grounded in authentic business data from both Chinese and U.S. equity markets, integrating online assessment. We performed clustering analysis on authentic user queries from financial platforms, resulting in eight fundamental tasks and two online tasks across four core business scenarios, totaling 29,578 expert-level Q&A pairs. Experimental results demonstrate that ChatGPT-5 achieves a prominent 61.5% accuracy in main tasks, though a substantial gap relative to financial experts persists; in online tasks, DeepSeek-R1 outperforms all other commercial LLMs. Error analysis further identifies the specific capability deficiencies of existing models within practical financial business contexts. BizFinBench.v2 transcends the limitations of current benchmarks, achieving a business-level deconstruction of LLM financial capabilities and providing a precise basis for evaluating efficacy in the widespread deployment of LLMs within the financial domain.
+                    </p>
+                </div>
+            </div>
+        </div>
+        <!--/ Abstract. -->
+    </div>
+</section>
+
+
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <h2 class="title is-2">Overview</h2>
+            <br>
+        </div>
+        <!-- Architecture -->
+        <div class="columns is-centered">
+            <div class="column is-full-width">
+                <h4 class="title is-3">• Overall Model Performance</h4>
+                <div class="content has-text-justified">
+                    <p>
+                        The complete model ranking results are shown below. (Average Score)
+
+                    </p>
+                    <img class="columns is-centered has-text-centered" src="./static/images/score_sequence.png" alt="Teaser" width="95%"
+                         style="margin:0 auto">
+                    <br>
+                    <figcaption>
+                        <p style="text-align: center; color: #1d3f9c;">
+                        </p>
+                    </figcaption>
+                </div>
+                <h4 class="title is-3">• Statistics </h4>
+                    <div class="content has-text-justified">
+                        <img class="columns is-centered has-text-centered" src="./static/images/BizFinBench.v2.png" alt="Teaser" width="55%"
+                        style="margin:0 auto">
+                        <br>
+                        <br>
+                        <p>
+                            
+                        </p>
+                    
+                    <img class="columns is-centered has-text-centered" src="./static/images/statistics.png" alt="Teaser" width="95%"
+                         style="margin:0 auto">
+                    <br>
+                    <figcaption>
+                        <p style="text-align: center; color: #061E61;">
+                        </p>
+                    </figcaption>
+                    </div>
+            </div>
+        </div>
+
+
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <h2 class="title is-2">Results on BizFinBench.v2</h2>
+            <br>
+        </div>
+        <div class="columns is-centered">
+            <div class="column is-full-width"> 
+                <div class="content has-text-justified">
+                    <p>
+                        From an overall performance perspective, ChatGPT-5 ranks first among all participating models with an average accuracy of 61.5%, highlighting its comprehensive competitive advantage in financial scenarios. Furthermore, proprietary models such as Gemini-3 and Doubao-Seed-1.6 also demonstrate excellent performance, ranking within the top three across multiple tasks. Within the category of open-source models, Qwen3-235B-A22B-Thinking-2507 emerges as the top-performing model with an average accuracy of 53.3%. In contrast, the leading financial model, Dianjin-R1, achieves an average accuracy of only 35.7%, trailing Qwen3-32B by a margin of 5.6%. We analyze this discrepancy from two perspectives: first, the training data for financial-specific models is primarily derived from open-source financial datasets centered on financial knowledge and simulated scenarios, which fail to map the complex characteristics of real-world financial business environments; second, although Dianjin-R1 incorporates customer service Q\&A data, its business coverage remains narrow, making it difficult to adapt to more volatile and long-context practical business scenarios.
+                    </p>
+                    <img class="columns is-centered has-text-centered" src="./static/images/detail_result.png" alt="Teaser" width="95%"
+                         style="margin:0 auto">
+                    <br>
+
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <h2 class="title is-2">Online Evaluation</h2>
+            <br>
+        </div>
+        <div class="columns is-centered">
+            <div class="column is-full-width"> 
+                
+                    <div class="content has-text-justified">
+                    <img class="columns is-centered has-text-centered" src="./static/images/Asset_allocation.png" alt="Teaser" width="95%"
+                         style="margin:0 auto">
+                    <br>
+                    </div>
+                    </div>
+</section>
+
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <h2 class="title is-2">Case Study</h2>
+            <br>
+        </div>
+        <div class="columns is-centered">
+            <div class="column is-full-width"> 
+                <h3 class="title is-4">• Financial Quantitative Computation</h3>
+                    <div class="content has-text-justified">
+                    <img class="columns is-centered has-text-centered" src="./static/images/case_study_CI.png" alt="Teaser" width="95%"
+                         style="margin:0 auto">
+                    <br>
+                    </div>
+                
+                    </div>
+</section>
+
+
+</section>
+<section class="hero is-light is-small">
+  <div class="hero-body has-text-centered">
+    <h1 class="title is-1 mathvista_other" id="citation">Citation</h1>
+  </div>
+</section>
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <pre><code>
+        Coming Soon
+</code></pre>
+  </div>
+</section>

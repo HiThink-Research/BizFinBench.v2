@@ -1,1 +1,0 @@
-python run.py --config config/offical/BizFinBench_v2.yaml --model_name --model_path /mnt/data/llm/models/chat/Qwen3-0.6B
