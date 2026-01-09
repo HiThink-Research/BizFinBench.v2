@@ -40,7 +40,7 @@
 * **Online Prowess:** **DeepSeek-R1** outperforms all other commercial LLMs in dynamic online tasks, achieving a total return of 13.46% with a maximum drawdown of -8%.
 
 ## 📢 News 
-- 🚀 [06/01/2026] TBD
+- 🚀 [08/01/2026] BizFinBench.v2 is out: 29,578 real-world financial questions so tough that ChatGPT-5 only scores 61.5/100. 
 
 ## 📕 Data Distrubution
 BizFinBench.v2 contains multiple subtasks, each focusing on a different financial understanding and reasoning ability, as follows:
@@ -64,9 +64,6 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 | **Real-time Market Discernment** | Stock Price Prediction | 5,510 | 4,000 |
 | | Portfolio Asset Allocation | — | — |
 | **Total** | **—** | **—** | **29,578** |
-
-### Data Download
-Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd/view?usp=drive_link">here</a> to download the data of BizFinBench.v2
 
 ## 📚 Example
 <div align="center">
