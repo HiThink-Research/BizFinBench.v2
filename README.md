@@ -69,7 +69,18 @@ BizFinBench.v2 contains multiple subtasks, each focusing on a different financia
 <div align="center">
 <img src="static/anomly_information_tracing.png" alt="Anomly Information Tracing" width="60%">
 </div>
-Others are Coming Soon
+Others example can be found in our paper
+
+## 📚 LLM Portfolio
+Online result can be found [HERE](https://www.ainvest.com/llm-portfolio/)
+
+<div align="center">
+<img src="static/Asset_allocation.png" alt="llm portfolio" width="60%">
+</div>
+
+<div align="center">
+<img src="static/deepseek_asset_portfolio.png" alt="deepseek_asset_portfolio.png" width="60%">
+</div>
 
 ## 🛠️ Usage （Not ready for now）
 ### Install requirements
