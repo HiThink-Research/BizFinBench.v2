@@ -74,7 +74,7 @@ Click <a href="https://drive.google.com/file/d/1X_RM6V-z-D9Rf9MEjLKQxqdK4ko6OdEd
 </div>
 Others are Coming Soon
 
-## 🛠️ Usage
+## 🛠️ Usage （Not ready for now）
 ### Install requirements
 ```sh
 pip install -r requirements.txt
