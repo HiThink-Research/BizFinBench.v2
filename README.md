@@ -33,7 +33,7 @@
 
 * **Authentic & Real-Time:** 100% derived from real financial platform queries, integrating online assessment capabilities.
 * **Expert-Level Difficulty:** A challenging dataset of **29,578 Q&A pairs** requiring professional financial reasoning.
-* **Comprehensive Coverage:** Spans **4 core business scenarios**, 8 fundamental tasks, and 2 online tasks.
+* **No Judge Model:** Utilizes rule-based metrics instead of dynamic judge models to ensure 100% reproducibility, high efficiency, and reliable scoring.
 
 ### 📊 Key Findings
 * **High Difficulty:** Even **ChatGPT-5** achieves only 61.5% accuracy on main tasks, highlighting a significant gap vs. human experts.
