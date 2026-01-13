@@ -20,7 +20,7 @@
     </div>
   </p>
   <p>
-  📖<a href="">Paper</a> |🏠<a href="https://hithink-research.github.io/BizFinBench.v2/">Homepage</a></h3>|🤗<a href="https://huggingface.co/datasets/HiThink-Research/BizFinBench.v2">Huggingface</a></h3>
+  📖<a href="https://arxiv.org/abs/2601.06401">Paper</a> |🏠<a href="https://hithink-research.github.io/BizFinBench.v2/">Homepage</a></h3>|🤗<a href="https://huggingface.co/datasets/HiThink-Research/BizFinBench.v2">Huggingface</a></h3>
   </p>
 <div align="center"></div>
 <p align="center">
