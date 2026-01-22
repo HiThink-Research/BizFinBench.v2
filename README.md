@@ -125,7 +125,12 @@ python run.py --config config/offical/BizFinBench_v2.yaml --model_name ${MODEL_N
 ## ✒️Citation
 
 ```
-Coming Soon
+@article{guo2026bizfinbench,
+  title={BizFinBench. v2: A Unified Dual-Mode Bilingual Benchmark for Expert-Level Financial Capability Alignment},
+  author={Guo, Xin and Zhang, Rongjunchen and Lu, Guilong and Guo, Xuntao and Jia, Shuai and Yang, Zhi and Zhang, Liwen},
+  journal={arXiv preprint arXiv:2601.06401},
+  year={2026}
+}
 ```
 
 ## 📄 License
