@@ -6,20 +6,52 @@ import os
 import argparse
 import importlib
 import asyncio
-import requests
+import aiohttp
+import aiohttp
 import time
 import json
 from tqdm import tqdm
 from loguru import logger
 from statistic import statistic
 
+
 cur_path = os.path.dirname(os.path.abspath(__file__))
 
 remote_model_port = os.getenv('REMOTE_MODEL_PORT')
 judge_model_port = os.getenv('JUDGE_MODEL_PORT')
-session = requests.Session()
+session: aiohttp.ClientSession = None
+session: aiohttp.ClientSession = None
 task_status: dict[str, dict] = {}
 model_status: dict[str, dict] = {}
+judge_status: dict[str, dict] = {}
+
+
+def start_inference_engine(model, port=None, **kwargs):
+    """启动模型推理服务"""
+    if remote_model_port is not None and port is None:  # 如果端口已被占用，端口号增加1，直至找到未被占用的端口
+        port = int(remote_model_port) + 1
+        while subprocess.run(f'netstat -tuln | grep -q ":{port} "', shell=True).returncode == 0:
+            port += 1
+    port = str(port)
+    cmd = [
+        "python", os.path.join(cur_path, "inference", "predict_multi_gpu.py"),
+        "--model", model,
+        "--server_port", port,
+    ]
+    kwargs.setdefault('prompt', 'chat_template')
+    for k, v in kwargs.items():
+        if v:
+            cmd.extend([f'--{k}', str(v)])
+    cmd.extend([
+        "--run_forever",
+        "--low_vram",
+        "&"
+    ])
+    cmd = ' '.join(cmd)
+    logger.info(f'启动推理引擎：{cmd}')
+    subprocess.run(cmd, shell=True)
+    model_status.setdefault(port, {})['terminated'] = False
+    return port
 
 
 def check_inference_engine_running(port=None):
@@ -44,7 +76,9 @@ async def run_command(cmd):
     rc = process.poll()
 
 
-async def send_request(data, method, port, path='file', retry_interval=10, max_retries=10, ignore_errors=False):
+async def send_request(
+    data, method, port, path='file', json=False, retry_interval=10, max_retries=10, ignore_errors=False
+):
     """用于请求推理引擎，包括：提交文件、请求推理进度、发送终止信号"""
     assert method in ['get', 'post']
     retry_times = 0
@@ -53,11 +87,13 @@ async def send_request(data, method, port, path='file', retry_interval=10, max_r
             raise RuntimeError(f'推理引擎已退出！({port=})')
         try:
             if method == 'post':
-                print('http://localhost:{}/{},{}'.format(port, path,data))
-                r = session.post('http://localhost:{}/{}'.format(port, path), data=data)
+                f = session.post
+                kwargs = {'json' if json else 'data': data}
             else:
-                r = session.get('http://localhost:{}/{}'.format(port, path), params=data)
-            r = r.json()
+                f = session.get
+                kwargs = {'params': data}
+            async with f('http://localhost:{}/{}'.format(port, path), **kwargs) as r:
+                r = await r.json()
             assert r['status_code'] == 0, str(r)
             return r
         except OSError:  # 有时会出现 ConnectionResetError: [Errno 104] Connection reset by peer，超过系统连接数限制？尝试再次连接
@@ -148,11 +184,25 @@ async def run_judge_inference(config, task):
         await external_api.texts2texts(input_list,output_file=d['output_path'])
     else:
         logger.info("开始使用本地大模型作为裁判进行评估")
-        r = await send_request(d, 'post', judge_model_port)
-        output_path.extend(r['output_path'])
+        if judge_model_port:
+            port = judge_model_port
+        else:  # 没有提前启动裁判员模型，根据子任务配置启动
+            jd = judge_status.setdefault(judge_data['judge_model_path'], {})
+            if tp := judge_data.get('judge_tensor_parallel'):
+                jd['judge_tensor_parallel'] = max(tp, jd.get('judge_tensor_parallel', 1))
+            jd['n_task'] = jd.get('n_task', 0) + 1
+            while (port := jd.get('port')) is None:
+                await asyncio.sleep(5)
+            await asyncio.sleep(5)
+        r = await send_request(d, 'post', port)
+        if r and r.get('output_path'):
+            output_path.extend(r['output_path'])
 
-        # 等待裁判员推理完成
-        await wait_for_inference(task + ' judge', judge_model_port, input_file, output_path[-1])
+            # 等待裁判员推理完成
+            await wait_for_inference(task + ' judge', port, input_file, output_path[-1])
+
+        if not judge_model_port:
+            jd['n_done'] = jd.get('n_done', 0) + 1
 
     task_status[task]['judge'] = True  # 裁判员模型推理完成
     return output_path
@@ -178,9 +228,9 @@ async def run_task_inference(config, task):
         外部API调用或本地模型推理可能产生的异常
     """
     input_path = config['tasks'][task]['data_path']
+    output_path = os.path.join(config['save_dir'], task + '.jsonl')
     #获取envs检测是否有external api
-    external_api = os.environ.get('API_NAME')
-    
+    external_api = os.environ.get('EXTERNAL_API')
     if external_api:
         logger.info("Using external api: {} to predict".format(external_api))
         from envs.constants import ExternalApi
@@ -189,12 +239,14 @@ async def run_task_inference(config, task):
     else:
         await send_request({
             'input_path': input_path,
-            'output_path': os.path.join(config['save_dir'], task + '.jsonl'),
+            'output_path': output_path,
+            'output_type': config['tasks'][task]['type'],
             'generation_params': json.dumps({
                 k: v for k, v in config['tasks'][task].items() if k in ['max_new_tokens']
             })
         }, 'post', remote_model_port)
         await wait_for_inference(task, remote_model_port, input_path)
+    return output_path
 
 
 async def wait_for_external_api(config,task, external_api,input_path):
@@ -230,23 +282,125 @@ async def wait_for_external_api(config,task, external_api,input_path):
         
 
 async def wait_for_inference(task, port, input_path, output_path=None):
+    params = {'input_path': input_path}
+    if output_path is not None:
+        params['output_path'] = output_path
     r_old = None
     while True:
         await asyncio.sleep(5)
-        r = await send_request({
-            'input_path': input_path,
-            'output_path': output_path,
-        }, 'get', port)
+        r = await send_request(params, 'get', port)
 
-        if r != r_old and r['n_pred'] > 0:  # 只有状态发生变化时才打印
+        if not r:
+            continue
+
+        if r != r_old and r.get('n_pred', 0) > 0:  # 只有状态发生变化时才打印
             logger.info("current task:{} status {}".format(task, r))  # {"status_code":0,"is_done":false,"n_samples":244128,"n_pred":74}
             r_old = r
 
-        if r['is_done']:
+        if r.get('is_done'):
             break
 
 
-async def maybe_start_judge_model():
+async def correct_answer_format(config, task):
+    """
+    检测“\\boxed”输出格式以及选择题，辅助模型以正确格式输出答案。
+
+    参数:
+        config (dict): 包含任务设置和路径的配置字典
+        task (str): 要运行推理的任务名称
+
+    返回:
+        None: 此函数执行操作但不返回值
+    """
+    # 默认不开启，需要在config.yaml中添加“answer_format_assist: true”以启用
+    if not config.get('answer_format_assist') or 'judge' in config['tasks'][task]:
+        return
+
+    # 仅针对compare_func中包含\boxed的任务做格式检查
+    func_path = config['tasks'][task]['compare_func']['path']
+    with open(func_path) as f:
+        if '\\boxed' not in f.read():
+            return
+
+    # 读取模型生成结果
+    output_path = os.path.join(config['save_dir'], task + '.jsonl')
+    with open(output_path) as f:
+        data = [json.loads(l) for l in f]
+
+    import re
+    batch = []
+    batch_size = 128
+    n_modified = 0
+    for i, d in enumerate(data):
+        try:
+            assert d['messages']
+            pred = d['predict_result']
+            target = d['choices'][0]['message']['content'][0]['text']
+            is_mc = re.match(r'[A-Z]$', target)  # 根据label判断是否为选择题
+        except KeyError:
+            continue
+
+        # 预处理样本
+        if pred and not (re.search(r'\\boxed{[A-Z]', pred) if is_mc else re.search(r'\\boxed{', pred)):
+            # 生成答案缺少\boxed格式，拼接答案模板并再次生成
+            n_modified += 1
+            if len(pred.encode('utf-8')) != len(pred):  # 包含非ascii字符，默认为中文
+                pred += '\n最终答案是\\boxed{'
+            else:
+                pred += '\nThe final answer is \\boxed{'
+
+            s = d.copy()
+            del s['predict_result']
+            # 模型请求参数
+            params = dict(prompt=s, preprocess_kwargs=dict(response_prefix=pred))
+            if is_mc:  # 如果是选择题，则取下一token的top-n概率
+                params['output_type'] = 'next_token_prob'
+                params['generation_params'] = dict(top_logprobs_num=10)
+            else:  # 不是选择题，则使用拼接后的答案模板生成答案
+                params['output_type'] = 'text'
+                params['generation_params'] = dict(max_new_tokens=20)  # 最终答案通常较短
+            t = asyncio.create_task(send_request(params, 'post', remote_model_port, path='model', json=True))
+            batch.append((i, is_mc, pred, t))
+
+        # 提交batch推理，处理结果
+        if len(batch) == batch_size or i == len(data) - 1:
+            rs = await asyncio.gather(*[t for *_, t in batch])  # 并发请求，等待结果
+            for r, (j, is_mc, pred, _) in zip(rs, batch):  # 处理结果
+                if not r.get('output'):
+                    continue
+                if is_mc:  # output: [['A', -0.004694137256592512],['C', -6.528131484985352],...]
+                    r = sorted(r['output'], key=lambda _i: _i[1], reverse=True)
+                    print([[_i[0], round(_i[1], 2)] for _i in r])
+                    choices = [s for t, _ in r if re.match(r'[A-Z]', s := t.strip())]
+                    data[j]['predict_result'] = pred + (choices[0] if choices else r[0][0]) + '}'
+                else:
+                    print(r['output'])
+                    data[j]['predict_result'] = pred + r['output']
+            batch.clear()
+            logger.info(f'{task=} total={len(data)} checked={i + 1} modified={n_modified}')
+
+    if n_modified:
+        with open(output_path, 'w') as f:
+            for d in data:
+                f.write(json.dumps(d, ensure_ascii=False) + '\n')
+
+
+async def restart_inference_engine(port=remote_model_port, **kwargs):
+    """重启模型推理服务以更换模型"""
+    args = [
+        "--server_port", port,
+        "--run_forever",
+        "--low_vram",
+    ]
+    kwargs.setdefault('prompt', 'chat_template')
+    for k, v in kwargs.items():
+        if v:
+            args.extend([f'--{k}', str(v)])
+    await send_request({'args': args}, 'post', port, path='restart', json=True)
+    return port
+
+
+async def maybe_start_judge_model(config):
     """
     等待全部测试集推理完成后，根据需要启动裁判员模型。
     
@@ -254,7 +408,10 @@ async def maybe_start_judge_model():
     1. 持续检查所有推理任务是否完成
     2. 如果任何任务需要裁判员模型，则终止推理引擎
     3. 在允许GPU资源释放的时间后启动裁判员模型进程
-    
+
+    参数:
+        config (dict): 包含推理评估配置的字典
+
     返回：
         无
         
@@ -267,21 +424,29 @@ async def maybe_start_judge_model():
         - 在终止推理后等待60秒再启动裁判员模型
     """
     while True:
-        # 添加判断如果不需要启动裁判员模型直接break
-        if not judge_model_port:
-            logger.info("不使用本地模型作为裁判，监听进程终止")
-            break
         await asyncio.sleep(5)
         if not check_inference_engine_running():
             raise RuntimeError(f'推理引擎已退出！')
         if all(t.get('inference') for t in task_status.values()):  # 全部任务都已推理完成
             if any(t.get('judge') is False for t in task_status.values()):  # 任意任务需要裁判员模型
                 logger.info('测试集推理完成，正在停止推理引擎，释放显卡，以启动裁判员模型')
-                await terminate_inference_engine(remote_model_port)  # 终止模型推理引擎，腾空显卡
-                await asyncio.sleep(60)
-                logger.info('正在启动裁判员模型')
-                await send_request(None, 'post', judge_model_port, 'start')  # 启动裁判员模型推理进程
-                await asyncio.sleep(5)
+                if judge_model_port:
+                    await terminate_inference_engine(remote_model_port)  # 终止模型推理引擎，腾空显卡
+                    await asyncio.sleep(60)
+                    logger.info('正在启动裁判员模型')
+                    await send_request(None, 'post', judge_model_port, 'start')  # 启动裁判员模型推理进程
+                else:
+                    for k, v in judge_status.items():
+                        logger.info('正在启动裁判员模型')
+                        v['port'] = await restart_inference_engine(
+                            model=k,
+                            tensor_parallel=v.get('judge_tensor_parallel') or config.get('judge_tensor_parallel'),
+                            max_length=config.get('judge_max_length'),
+                            max_new_tokens=config.get('judge_max_new_tokens'),
+                            backend=config.get('judge_backend'),
+                        )
+                        while v.get('n_done', 0) < v['n_task']:
+                            await asyncio.sleep(5)
             break
 
 
@@ -301,7 +466,8 @@ async def run_next_word_prob_eval(config, task, model_path):
 
 async def run_mt_bench_eval(config, task):
     async def get_response(msg):
-        result = await send_request(json.dumps({"prompt":{"instruction":msg}}), 'post', remote_model_port, path='model')
+        result = await send_request({"prompt":{"instruction":msg}}, 'post', remote_model_port, path='model', json=True)
+        result = await send_request({"prompt":{"instruction":msg}}, 'post', remote_model_port, path='model', json=True)
         return result
 
     with open(config['tasks'][task]['data_path'],'r') as f:
@@ -317,7 +483,7 @@ async def run_mt_bench_eval(config, task):
 
         prompt_2 = "Question:{}\nAnswer:{}\nQuestion:{}".format(d['turns'][0],d['response'][0],d['turns'][1])
         result_2 = await get_response(prompt_2)
-        if result_1:
+        if result_2:
             d['response'].append(result_2.json()['output'])
         out.append(d)
     with open("{}/mtbench.jsonl".format(config['save_dir']),'w') as f:
@@ -330,6 +496,8 @@ async def run_mt_bench_eval(config, task):
 
 async def run_text_eval(config, task):
     await run_task_inference(config, task)
+    await correct_answer_format(config, task)
+    await correct_answer_format(config, task)
     task_status[task]['inference'] = True  # 模型推理完成
 
     if 'judge' in config['tasks'][task]:
@@ -342,6 +510,69 @@ async def run_text_eval(config, task):
     await run_post_eval(config, task, output_path)
 
 
+async def run_cosyvoice2_eval(config, task):
+    await run_task_inference(config, task)
+    task_status[task]['inference'] = True  # 模型推理完成
+    if 'judge' in config['tasks'][task]:
+        task_status[task]['judge'] = False  # 等待裁判员模型推理
+        output_path = await run_judge_inference(config, task)
+        output_path = ','.join(output_path)
+    else:
+        output_path = os.path.join(config['save_dir'], task + '.jsonl')
+    await run_post_eval(config, task, output_path)
+
+
+async def run_retrieval_eval(config, task):
+    """向量检索（embedding模型）评估"""
+    # 输入数据（包含query和docs的json文件）
+    input_path = config['tasks'][task]['data_path']
+    input_dir = os.path.dirname(input_path)
+    data_files = [f for f in os.listdir(input_dir) if f.endswith('json') or f.endswith('jsonl')]
+    if not os.path.basename(input_path).startswith('test'):
+        if fs := [f for f in data_files if f.startswith('test')]:
+            input_path = os.path.join(input_dir, fs[0])
+    logger.info(f'检索query文件路径：{input_path}')
+
+    # docs数据
+    if fs := [f for f in data_files if 'docs' in f]:
+        docs_path = os.path.join(input_dir, fs[0])
+    else:
+        raise RuntimeError(f'{input_dir}路径下找不到检索docs文件！')
+    logger.info(f'检索docs文件路径：{docs_path}')
+
+    # 计算embedding
+    config['tasks'] = config['tasks'].copy()  # 局部修改
+    config['tasks'][task + '-query'] = {'data_path': input_path, 'type': 'embedding'}
+    config['tasks'][task + '-docs'] = {'data_path': docs_path, 'type': 'embedding'}
+    query_emb_file, docs_emb_file = await asyncio.gather(
+        run_task_inference(config, task + '-query'),
+        run_task_inference(config, task + '-docs'),
+    )
+    task_status[task]['inference'] = True  # 模型推理完成
+
+    # retrieval
+    while not all(t.get('inference') for t in task_status.values()):  # 等待全部任务推理完成
+        await asyncio.sleep(5)
+    await restart_inference_engine(
+        output_type='retrieval',
+        backend='faiss',
+        documents=docs_emb_file,
+        preprocess='none',
+    )
+    config['tasks'][task]['data_path'] = query_emb_file
+    output_path = await run_task_inference(config, task)
+    await run_post_eval(config, task, output_path)
+
+
+async def run_mcp_eval(config, task):
+    """MCP（工具调用）评估"""
+    from tools.mcp_client import run_mcp_inference
+
+    output_path = await run_mcp_inference(config)
+    task_status[task]['inference'] = True  # 模型推理完成
+    await run_post_eval(config, task, output_path)
+
+
 async def run_post_eval(config, task, output_path):
     func_path = config['tasks'][task]['compare_func']['path']
     params = config['tasks'][task]['compare_func'].get('params')
@@ -351,6 +582,19 @@ async def run_post_eval(config, task, output_path):
     )
     print(cmd_eval)
     await run_command(cmd_eval)
+
+
+def determine_task_type(task_config: dict):
+    """根据评估函数，确定任务类型"""
+    compare_func_path = task_config.get('compare_func', {}).get('path')
+    if compare_func_path:
+        compare_func_path = os.path.basename(compare_func_path)
+        if compare_func_path.startswith('eval_turn_taking'):
+            task_config['type'] = 'turn_taking'
+        elif compare_func_path.startswith('eval_retrieval'):
+            task_config['type'] = 'retrieval'
+        elif compare_func_path.startswith('eval_mcp'):
+            task_config['type'] = 'mcp'
 
 
 async def llm_eval(file_path, model_name=""):
@@ -380,22 +624,30 @@ async def llm_eval(file_path, model_name=""):
         logger.info(f'开始评测任务：{task}')
         task_status[task] = {}
 
+        determine_task_type(config['tasks'][task])
         if config['tasks'][task]['type'] in ['loss']:
             coro = run_loss_eval(config, task, model_path)
         elif config['tasks'][task]['type'] in ['next_word_probability']:
             coro = run_next_word_prob_eval(config, task, model_path)
-        elif config['tasks'][task]['type'] in ['text']:
+        elif config['tasks'][task]['type'] in ['text', 'turn_taking']:
             if task == 'mtbench':
                 coro = run_mt_bench_eval(config, task)
             else:
                 coro = run_text_eval(config, task)
+        elif config['tasks'][task]['type'] in ['cosyvoice2']:
+            coro = run_cosyvoice2_eval(config, task)
+        elif config['tasks'][task]['type'] in ['retrieval']:
+            coro = run_retrieval_eval(config, task)
+        elif config['tasks'][task]['type'] in ['mcp']:
+            coro = run_mcp_eval(config, task)
 
         tasks_async[task] = asyncio.create_task(coro)
         await asyncio.sleep(1)
 
-    await maybe_start_judge_model()
-    await asyncio.gather(*tasks_async.values())
-    
+    await asyncio.gather(
+        maybe_start_judge_model(config),
+        *tasks_async.values()
+    )
 
     statistic(config["save_dir"],config)
 
@@ -404,7 +656,7 @@ async def terminate_inference_engine(port=None, ignore_errors=False):
     if port is not None:
         ports = [port]
     else:
-        ports = [remote_model_port, judge_model_port]
+        ports = [remote_model_port, judge_model_port] + [v['port'] for v in judge_status.values() if 'port' in v]
     for port in ports:
         if port and not model_status.get(port, {}).get('terminated'):
             await send_request(None, 'post', port, 'terminate', ignore_errors=ignore_errors)
@@ -412,12 +664,19 @@ async def terminate_inference_engine(port=None, ignore_errors=False):
 
 
 async def main(args):
-    try:
-        await llm_eval(args.config, args.model_name)
-        await terminate_inference_engine()
-    except:
-        await terminate_inference_engine(ignore_errors=True)
-        raise
+    is_node_0 = os.getenv('WORLD_SIZE', '1') == '1' or os.getenv('RANK', '0') == '0'
+    if is_node_0:
+        global session
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout()) as session:  # 取消超时限制（默认5分钟）
+            try:
+                await llm_eval(args.config, args.model_name)
+                await terminate_inference_engine()
+            except:
+                await terminate_inference_engine(ignore_errors=True)
+                raise
+    else:  # worker节点只需要等待推理进程退出
+        while any(check_inference_engine_running(p) for p in [remote_model_port, judge_model_port] if p):
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
@@ -427,7 +686,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     ## 添加判断，知道推理服务启动再开始评估
     t0 = time.time()
-
     while True:
         logger.info("infer engine initializing {:.2f} s".format(time.time()-t0))
         if time.time()-t0 > 20:

@@ -2,6 +2,7 @@ import json
 import re
 import numpy as np
 from rouge import Rouge
+from utils import JsonPaser
 
 def evaluation(input_path, **kwargs):
     """
@@ -184,34 +185,89 @@ def evaluation(input_path, **kwargs):
             except:
                 parse_failures += 1
                 continue
+            if not any(k in line for k in ("填写错误原因", "fill in error reason")):
+                try:
+                    choices = data.get("choices", [])
+                    correct_answer = ""
+                    if choices and len(choices) > 0:
+                        message = choices[0].get("message", {})
+                        content = message.get("content", [])
+                        if isinstance(content, list) and len(content) > 0:
+                            correct_answer = content[0].get("text", "")
+                        else:
+                            correct_answer = content    
+                    
+                    predict_result_str = data.get("predict_result", "")
 
-            pred_ids, id2cot_pred = parse_prediction(data)
-            truth_ids, id2cot_truth = parse_ground_truth(data)
+                    j_paser = JsonPaser()
+                    
+                    predict_data = j_paser.extract_json_from_text(predict_result_str)
+                    # import pdb;pdb.set_trace()
 
-            # 如果预测结果完全无法解析，同时也没有 ground truth，跳过该样本
-            if not pred_ids and not truth_ids:
-                parse_failures += 1
-                continue
+                    # if predict_data:
+                    if predict_data and isinstance(predict_data, dict):
+                        predicted_answers = predict_data["answer"] if predict_data.get("answer") else []
+                    else:
+                        predicted_answers = []
 
-            # ---- F1计算 ----
-            TP = len(pred_ids & truth_ids)
-            FP = len(pred_ids - truth_ids)
-            FN = len(truth_ids - pred_ids)
 
-            total_TP += TP
-            total_FP += FP
-            total_FN += FN
+                    if not isinstance(predicted_answers, list):
+                        predicted_answers = []
 
-            # ---- ROUGE-L计算 ----
-            for _id in (pred_ids & truth_ids):
-                pc = id2cot_pred.get(_id)
-                tc = id2cot_truth.get(_id)
-                if pc and tc and pc.strip() and tc.strip():
-                    try:
-                        scores = rouge.get_scores(pc, tc)
-                        rouge_scores.append(scores[0]['rouge-l']['f'])
-                    except:
-                        pass
+                    correct_answers = data['choices'][0]['message']['content'][0]['text']
+                    correct_answers = json.loads(correct_answers)
+                    if not isinstance(correct_answers, list):
+                        correct_answers = []
+                    
+                    if not isinstance(predicted_answers, list):
+                        predicted_answers = list(predicted_answers)
+                    predicted_answers = [int(x) for x in predicted_answers]
+
+                    pred_ids = set(predicted_answers)
+                    truth_ids = set(correct_answers)
+
+                    # ---- F1计算 ----
+                    TP = len(pred_ids & truth_ids)
+                    FP = len(pred_ids - truth_ids)
+                    FN = len(truth_ids - pred_ids)
+
+                    
+                    total_TP += TP
+                    total_FP += FP
+                    total_FN += FN
+
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                    data['eval_result'] = {"result": f"error: {str(e)}"}
+
+            
+            else:
+                pred_ids, id2cot_pred = parse_prediction(data)
+                truth_ids, id2cot_truth = parse_ground_truth(data)
+
+                # 如果预测结果完全无法解析，同时也没有 ground truth，跳过该样本
+                if not pred_ids and not truth_ids:
+                    parse_failures += 1
+                    continue
+
+                # ---- F1计算 ----
+                TP = len(pred_ids & truth_ids)
+                FP = len(pred_ids - truth_ids)
+                FN = len(truth_ids - pred_ids)
+
+                total_TP += TP
+                total_FP += FP
+                total_FN += FN
+
+                # ---- ROUGE-L计算 ----
+                for _id in (pred_ids & truth_ids):
+                    pc = id2cot_pred.get(_id)
+                    tc = id2cot_truth.get(_id)
+                    if pc and tc and pc.strip() and tc.strip():
+                        try:
+                            scores = rouge.get_scores(pc, tc)
+                            rouge_scores.append(scores[0]['rouge-l']['f'])
+                        except:
+                            pass
 
     # 计算指标
     precision = total_TP / (total_TP + total_FP) if (total_TP + total_FP) else 0.0
