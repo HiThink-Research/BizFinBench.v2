@@ -1,0 +1,44 @@
+# where to save your prediect result
+save_dir: eval_result/
+
+tasks:
+    anomaly_information_tracing_cn:
+        type: text
+        data_path: datasets/cn/anomaly_information_tracing_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_AEA_2.py
+    financial_quantitative_computation_cn:
+        type: text
+        data_path: datasets/cn/financial_quantitative_computation_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_calculation_2.py
+    financial_data_description_cn:
+        type: text
+        data_path: datasets/cn/financial_data_description_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_description_no_cot.py
+    financial_multi-turn_perception_cn:
+        type: text
+        data_path: datasets/cn/financial_multi-turn_perception_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_multi_round_desc.py
+    event_logic_reasoning_cn:
+        type: text
+        data_path: datasets/cn/event_logic_reasoning_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_logic_event.py
+    conterfactual_cn:
+        type: text
+        data_path: datasets/cn/conterfactual_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_calculation_2.py
+    stock_price_predict_cn:
+        type: text
+        data_path: datasets/cn/stock_price_predict_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_stock_price_predict_short_term.py
+    user_sentiment_analysis_cn:
+        type: text
+        data_path: datasets/cn/user_sentiment_analysis_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_emotion.py
