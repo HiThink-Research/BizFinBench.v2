@@ -27,9 +27,7 @@ def evaluation(input_path, **kwargs):
             j_paser = JsonPaser()
             
             predict_data = j_paser.extract_json_from_text(predict_result_str)
-            # import pdb;pdb.set_trace()
 
-            # if predict_data:
             if predict_data and isinstance(predict_data, dict):
                 predicted_answers = predict_data["answer"] if predict_data.get("answer") else []
             else:

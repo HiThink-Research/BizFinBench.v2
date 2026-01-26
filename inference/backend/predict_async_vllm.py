@@ -7,15 +7,12 @@ os.environ['NCCL_NVLS_ENABLE'] = '0'  # 如不设置，tensor_parallel=8时，�
 os.environ['TRANSFORMERS_NO_ADVISORY_WARNINGS'] = '1'
 
 sys.path.append(os.path.realpath(os.path.dirname(os.path.abspath(__file__))))
-from adaptor_base import set_device, EngineAdaptorBase
+from adaptor_base import set_device, get_local_worker_id, EngineAdaptorBase
 
 set_device()
 
 if not os.getenv('VLLM_PORT'):
-    vllm_port = 1033  # 设为1000到6000之间，以避免与平台端口冲突
-    if devices := os.getenv('CUDA_VISIBLE_DEVICES'):
-        vllm_port += int(devices.split(',')[0]) * 100
-    os.environ['VLLM_PORT'] = str(vllm_port)
+    os.environ['VLLM_PORT'] = str(1033 + int(get_local_worker_id()) * 100)  # 设为1000到6000之间，以避免与平台端口冲突
 
 import argparse
 import asyncio
@@ -41,6 +38,7 @@ if hasattr(vllm.inputs, 'PromptInputs') or hasattr(vllm.inputs, 'PromptType'):  
 
 is_v1_engine = version.parse(vllm.__version__) >= version.parse('0.8.0') and os.getenv('VLLM_USE_V1', '1') != '0'
 is_vllm_v_0_9 = version.parse(vllm.__version__) >= version.parse('0.9.0')
+is_vllm_v_0_11_1 = version.parse(vllm.__version__) >= version.parse('0.11.1')
 
 from multimodal import load_multimodal_data
 
@@ -58,7 +56,7 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
     def should_stop_adding_sample(self, n_added):
         return (
             n_added >= 2  # 一次最多添加 2 条样本
-            or len(self.waiting) >= 8  # 超过 8 条样本在排队，暂停添加新样本
+            or len(self.waiting) >= 2  # 超过 2 条样本在排队，暂停添加新样本
             or any(time.time() - v > 10. for v in self.idx2stime.values())  # 任意请求token延迟超过10秒，暂停添加新样本
         )
 
@@ -66,6 +64,9 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
         params = r.get('generation_params', {})
         sample_n = params.get('n', args.sample_n)
         otype = r.get('output_type', args.output_type)
+        if otype == 'beam_search' and sample_n == 1:
+            otype = 'text'
+        r['output_type'] = otype
         if otype == 'loss':
             sampling_params = SamplingParams(
                 temperature=0,
@@ -101,7 +102,6 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
             sampling_params.stop_token_ids = [6561, 6563]
         else:
             sampling_params = SamplingParams(
-                n=1 if otype == 'beam_search' else sample_n,
                 max_tokens=params.get('max_new_tokens', args.max_new_tokens),
                 temperature=params.get('temperature', args.temperature),
                 top_p=params.get('top_p', args.top_p),
@@ -115,12 +115,27 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
             sampling_params=sampling_params,
             request_id=r['idx'],
             otype=otype,
+            sample_n=sample_n,
         )
 
-    async def predict_sample(self, inputs: list[int] | dict, sampling_params: SamplingParams, request_id: str, otype: str):
+    async def predict_sample(
+        self,
+        inputs: list[int] | dict,
+        sampling_params: SamplingParams,
+        request_id: str,
+        otype: str,
+        sample_n: int,
+    ):
         if self.args.output_type == 'cosyvoice2':
             results_generator = await self.model.generate(inputs, request_id=request_id)
+        elif sample_n > 1:
+            self.waiting.discard(request_id)
+            return await asyncio.gather(*[
+                self.predict_sample(inputs, sampling_params, f'{request_id}_{i}', otype, sample_n=1)
+                for i in range(sample_n)
+            ])
         else:
+            self.waiting.add(request_id)
             results_generator = await self.generate(inputs, request_id, sampling_params, otype)
         try:
             final_output = await asyncio.wait_for(
@@ -168,6 +183,9 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
         else:  # list[int]
             inputs = dict(prompt=None, prompt_token_ids=inputs)
 
+        if getattr(sampling_params, 'detokenize', None) is True and sampling_params.stop is None:  # 只需要返回token ids，减少cpu占用
+            sampling_params.detokenize = False
+
         if vllm_prompt_type == 1:  # vllm >= 0.5.3
             return self.model.generate(
                 inputs,
@@ -181,16 +199,20 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
                 request_id=request_id,
             )
 
-    async def get_generator_result(self, result_generator, request_id) -> RequestOutput:
+    async def get_generator_result(self, result_generator, request_id) -> RequestOutput | list[RequestOutput]:
         if isinstance(result_generator, list):
             final_output = await asyncio.gather(*[self.get_generator_result(g, request_id) for g in result_generator])
             return final_output
 
         final_output = None
-        async for request_output in result_generator:
+        try:
+            async for request_output in result_generator:
+                self.waiting.discard(request_id)
+                self.idx2stime[request_id] = time.time()
+                final_output = request_output
+        except ValueError:  # e.g 超出模型最大长度（vllm/v1/engine/processor.py, _validate_model_input）
             self.waiting.discard(request_id)
-            self.idx2stime[request_id] = time.time()
-            final_output = request_output
+        self.idx2stime.pop(request_id, None)
         return final_output
 
     def convert_final_output(self, inputs: dict, final_output: RequestOutput | list[RequestOutput], otype: str):
@@ -303,13 +325,16 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
 
         rope_scaling = getattr(config, 'rope_scaling', {}) or {}
         rope_scaling_factor = 1. if rope_scaling.get('rope_type') == 'llama3' else rope_scaling.get('factor', 1.)
-        max_model_length = int(
-            getattr(config, 'max_position_embeddings', 0) * rope_scaling_factor
-            or getattr(config, 'seq_length', 0)
+        original_max_pe = rope_scaling.get(
+            'original_max_position_embeddings', getattr(config, 'max_position_embeddings', 0)
         )
+        max_model_length = int(original_max_pe * rope_scaling_factor or getattr(config, 'seq_length', 0))
 
-        import vllm.config
-        get_config = vllm.config.get_config
+        try:
+            import vllm.config.model as vllm_config
+        except ModuleNotFoundError:  # vllm < v0.11
+            import vllm.config as vllm_config
+        get_config = vllm_config.get_config
 
         def _get_config(model, *_args, **kwargs):
             config = get_config(model, *_args, **kwargs)
@@ -328,12 +353,15 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
                     config.architectures.append('MistralForCausalLM')
             text_config = getattr(config, 'text_config', config)
             if args.max_length and args.max_length != max_model_length:
-                max_pe = int(args.max_length / rope_scaling_factor)
+                max_pe = args.max_length
+                if rope_scaling.get('rope_type') != 'yarn':
+                    max_pe /= rope_scaling_factor
+                max_pe = int(max_pe)
                 print(f'Overriding max_position_embeddings: {text_config.max_position_embeddings} -> {max_pe}')
                 text_config.max_position_embeddings = max_pe
             return config
 
-        vllm.config.get_config = _get_config
+        vllm_config.get_config = _get_config
 
         if is_v1_engine:
             if args.max_length is not None:
@@ -363,12 +391,9 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
         if args.pipeline_parallel > 1:
             assert hasattr(args, 'pipeline_parallel_size')
             args.pipeline_parallel_size = args.pipeline_parallel
-            # 减少DeepSeek-R1推理卡住的机率
-            args.enable_chunked_prefill = True
-            args.enable_prefix_caching = True
-            args.max_num_batched_tokens = 8192
 
         if args.tensor_parallel_size > 1 and hasattr(config, 'moe_intermediate_size') and hasattr(args, 'enable_expert_parallel'):
+            print('setting args.enable_expert_parallel = True')
             args.enable_expert_parallel = True  # MoE模型使用专家并行
 
         if "Processor" in type(processor).__name__:
@@ -384,7 +409,10 @@ class VLLMEngineAdaptor(EngineAdaptorBase):
 
 if __name__ == "__main__":
     if is_vllm_v_0_9:
-        from vllm.utils import FlexibleArgumentParser as ArgumentParser  # vllm >= 0.9
+        if is_vllm_v_0_11_1:
+            from vllm.utils.argparse_utils import FlexibleArgumentParser as ArgumentParser  # vllm >= 0.11.1
+        else:
+            from vllm.utils import FlexibleArgumentParser as ArgumentParser  # vllm >= 0.9
         add_argument = ArgumentParser.add_argument
         def _add_argument(self, dest, *args, **kwargs):
             dest = dest.replace('_', '-')

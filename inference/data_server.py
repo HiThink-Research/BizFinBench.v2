@@ -9,6 +9,7 @@ import importlib
 import inspect
 import traceback
 import uuid
+import math
 import datasets
 
 from collections import deque
@@ -27,6 +28,7 @@ app.config.RESPONSE_TIMEOUT = 60 * 60 * 24  # 24 hours
 
 global_args: list[str] = None
 data_args : list[str] = sys.argv[1:]
+is_args_loaded = asyncio.Event()  # 确保参数已加载后再处理请求
 node_info: dict = {}  # 各个节点的运行状态
 
 args: argparse.Namespace = None
@@ -47,6 +49,7 @@ info = {  # 全局信息
     't_curr': 0.,   # 当前的时间戳
     'error': 0,
     'terminated': False,  # 下游发送终止信号
+    'sleeping': False,  # 下游发送睡眠信号
     'post_start': False  # 下游发送启动信号
 }
 
@@ -73,6 +76,7 @@ class FileData:
     )
     overwrite: bool = None
     is_done: bool = False  # 已完成预测并写入结果
+    is_aborted: bool = False  # 下游请求终止文件推理
     preprocess_kwargs: Optional[dict] = None
     generation_params: Optional[dict] = None
 
@@ -102,9 +106,7 @@ def is_all_done():
 
 def is_file_all_read(d: FileData):
     """判断数据（文件）是否已全部读取并提交推理"""
-    return d.read is not None and d.read.done() and d.j_pred == len(
-        d.samples if args.subsample is None else d.subsample_ids
-    )
+    return d.read is not None and d.read.done() and d.j_pred >= get_num_samples(d)
 
 
 def is_file_all_done(d: FileData, written=False):
@@ -112,9 +114,18 @@ def is_file_all_done(d: FileData, written=False):
     if d.is_done:
         return True
     n_curr = d.n_write if written else d.n_pred
-    return d.read is not None and d.read.done() and n_curr == len(
-        d.samples if args.subsample is None else d.subsample_ids
-    )
+    return d.read is not None and d.read.done() and n_curr >= get_num_samples(d)
+
+
+def get_num_samples(d: FileData, remaining=False):
+    """返回单个文件需要推理的样本数量"""
+    samples = d.samples if args.subsample is None else d.subsample_ids
+    n_total = len(samples) if samples else 0
+    if remaining:
+        n_remain = max(0, n_total - d.j_pred)
+        return n_remain
+    else:
+        return n_total
 
 
 def get_num_done():
@@ -133,25 +144,31 @@ async def get_info(request: Request):
     """供主进程（`predict_multi_gpu.py`）调用，返回全局信息，包括已完成的样本/文件数量等"""
     info['n_file'] = len(file_list)
     info['n_done'] = get_num_done()
-    info['n_queue'] = sum(d.j_pred for d in file_list[:info['i_pred'] + 1])
-    info['n_read'] = sum(1 for d in file_list[:info['i_pred'] + 1] if is_file_all_read(d))
+    info['n_queue'] = sum(d.j_pred for d in file_list)
+    info['n_read'] = sum(1 for d in file_list if is_file_all_read(d))
     info['t_curr'] = time.time()
     info['node_info'] = node_info
     if global_args:
         info['global_args'] = global_args
-    return response.json(info)
+    r = info
+    if (rank := request.args.get('rank')) and should_terminate_rank(rank, check_running=True):
+        r = r.copy()
+        r['terminated'] = True
+    return response.json(r)
 
 
 @app.post("/node")
 async def post_node(request: Request):
     """供主进程（`predict_multi_gpu.py`）调用，传入节点信息"""
     rank = request.json['rank']
-    if global_args:
-        if ' '.join(global_args) != ' '.join(request.json['args']):
+    node_info.setdefault('ranks', {}).setdefault(rank, {'ip': request.client_ip})
+    if (n_workers := request.json.get('n_workers')) is not None:
+        node_info['ranks'][rank]['n_workers'] = n_workers
+    if global_args and (args := request.json.get('args')) is not None:
+        if ' '.join(global_args) != ' '.join(args):
             info['error'] += 1
             raise ValueError(f'global_args mismatch! server={global_args} client={request.json["args"]}')
 
-    node_info.setdefault('ranks', {})[rank] = {'ip': request.client_ip}
     return response.json({
         'status_code': 0,
         'status_msg': 'ok'
@@ -162,17 +179,29 @@ async def post_node(request: Request):
 async def get_data(request: Request):
     """供worker（predict_async.py）调用，返回待预测的inputs"""
     try:
-        if (rank := request.args.get('rank')) not in node_info.get('ranks', {}):  # node_info中不包含当前rank，说明是旧的推理worker（等待重启）
+        if (
+            (rank := request.args.get('rank')) not in node_info.get('ranks', {})  # node_info中不包含当前rank，说明是旧的推理worker（等待重启）
+            or should_terminate_rank(rank, check_running=False)  # 用户发送终止rank的信号
+        ):
             return response.json({'status_code': 1})
         else:
             rank_info = node_info['ranks'][rank]
             rank_info.setdefault('n_queue', 0)  # 模型加载完成信号
+            worker_id = request.args.get('worker_id')
+            worker_info = rank_info.setdefault('workers', {}).setdefault(worker_id, {})
+            if (ss := request.args.get('sleep_state')) is not None:
+                worker_info['sleep_state'] = int(ss)
 
         if info['terminated']:
             return response.json({'status_code': 2, 'status_msg': 'terminated'})
+        elif info['sleeping'] or rank_info.get('sleeping'):
+            return response.json({'status_code': 3, 'status_msg': 'sleeping'})
 
         if not info['t_start']:
             info['t_start'] = time.time()
+
+        if should_throttle_worker(rank, worker_id):
+            return response.json({'status_code': 1})
 
         while input_queue:
             s = input_queue.popleft()
@@ -191,22 +220,13 @@ async def get_data(request: Request):
             if s.next_token_ids is not None:
                 r['next_token_ids'] = s.next_token_ids
             rank_info['n_queue'] = rank_info.get('n_queue', 0) + 1
+            worker_info['n_queue'] = worker_info.get('n_queue', 0) + 1
             return response.json(r)
 
         while True:
-            i = info['i_pred']
-            try:
-                d = file_list[i]
-            except IndexError:
-                d = None
-            if d is None or is_file_all_read(d):  # 当前数据（文件）已全部提交推理
-                if i < len(file_list) - 1:  # 还有其他数据文件
-                    i += 1
-                    info['i_pred'] = i
-                    d = file_list[i]
-                else:
-                    # print('get: all done!')
-                    return response.json({'status_code': 1})
+            i, d = get_current_file()
+            if d is None:
+                return response.json({'status_code': 1})  # all done!
 
             if d.read is None:  # 开始读取数据（异步）
                 d.read = asyncio.get_running_loop().run_in_executor(
@@ -251,6 +271,7 @@ async def get_data(request: Request):
             if 'max_new_tokens' in s:  # 支持针对单条样本设置生成长度
                 r['generation_params']['max_new_tokens'] = s['max_new_tokens']
             rank_info['n_queue'] = rank_info.get('n_queue', 0) + 1
+            worker_info['n_queue'] = worker_info.get('n_queue', 0) + 1
             return response.json(r)
     except:
         info['error'] += 1
@@ -261,16 +282,19 @@ async def get_data(request: Request):
 async def post_result(request: Request):
     """供worker（predict_async.py）调用，传入预测结果"""
     try:
-        otype = request.json['output_type']
-        output = request.json['output']
-        if otype in ['text', 'beam_search']:
-            output = convert_output_to_text(output)
-        elif otype == 'next_token_prob':
-            output = [[decode([token_id]), logprob] for token_id, logprob in output]
-        elif otype == 'reward':
-            if isinstance(output, dict):
-                output['rewards'] = [round(s, 4) for s in output['rewards']]
-                output['gating_output'] = [round(s, 4) for s in output['gating_output']]
+        if e := request.json.get('error'):
+            output = {'type': 'error', 'msg': e}
+        else:
+            otype = request.json['output_type']
+            output = request.json['output']
+            if otype in ['text', 'beam_search']:
+                output = convert_output_to_text(output)
+            elif otype == 'next_token_prob':
+                output = [[decode([token_id]), logprob] for token_id, logprob in output]
+            elif otype == 'reward':
+                if isinstance(output, dict):
+                    output['rewards'] = [round(s, 4) for s in output['rewards']]
+                    output['gating_output'] = [round(s, 4) for s in output['gating_output']]
 
         idx = request.json['idx']
         # print('post:', idx)
@@ -281,12 +305,24 @@ async def post_result(request: Request):
         else:
             i_data, i_sample = map(int, idx.split('_'))
             d = file_list[i_data]
-            r = d.samples[i_sample if args.subsample is None else d.subsample_ids[i_sample]].copy()
+            i = i_sample if args.subsample is None else d.subsample_ids[i_sample]
+            r = d.samples[i]
+            if isinstance(d.samples, list):  # 释放内存（如果是Dataset则不允许修改）
+                d.samples[i] = None
             output_key = d.output_key or args.output_key
             r[output_key] = output
             set_result(i_data, i_sample, r)
+            if isinstance(output, dict) and output.get('type') == 'error':
+                print(output['msg'])
+                info['error'] += 1
         info['n_pred'] += 1
-        if info['terminated']:
+        rank = request.json.get('rank')
+        if (rank_info := node_info.get('ranks', {}).get(rank)) is not None:
+            worker_info = rank_info.setdefault('workers', {}).setdefault(request.json.get('worker_id'), {})
+            rank_info['n_pred'] = rank_info.get('n_pred', 0) + 1
+            worker_info['n_pred'] = worker_info.get('n_pred', 0) + 1
+            worker_info['sleep_state'] = request.json.get('sleep_state')
+        if info['terminated'] or should_terminate_rank(rank, check_running=True):
             return response.json({'status_code': 2, 'status_msg': 'terminated'})
         else:
             return response.json({'status_code': 0})
@@ -315,6 +351,7 @@ async def openai_v1_chat_completions(request: Request):
             kwargs['chat_template_kwargs'] = chat_template_kwargs
         if reasoning_effort := request.json.get('reasoning_effort'):
             kwargs.setdefault('chat_template_kwargs', {})['reasoning_effort'] = reasoning_effort
+        await is_args_loaded.wait()
         convert_sample_to_inputs, kwargs = get_preprocess_func(output_type=otype, kwargs=kwargs)
         inputs = convert_sample_to_inputs(sample, args.prompt, tokenizer, **kwargs)
 
@@ -339,6 +376,12 @@ async def openai_v1_chat_completions(request: Request):
         uid2sample[s.uid] = s
 
         await s.done_event.wait()
+        if isinstance(s.output, dict) and s.output.get('type') == 'error':
+            return response.json({
+                'object': 'error',
+                'code': -1,
+                'message': s.output['msg']
+            })
 
         outputs = s.output if isinstance(s.output, list) else [s.output]
         choices = []
@@ -402,6 +445,7 @@ async def post_inputs(request: Request):
             kwargs = request.json.get('preprocess_kwargs') or {}
             if chat_template_kwargs := request.json.get('chat_template_kwargs'):
                 kwargs['chat_template_kwargs'] = chat_template_kwargs
+            await is_args_loaded.wait()
             convert_sample_to_inputs, kwargs = get_preprocess_func(output_type=otype, kwargs=kwargs)
             inputs = convert_sample_to_inputs(prompt, args.prompt, tokenizer, **kwargs)
         else:
@@ -430,6 +474,13 @@ async def post_inputs(request: Request):
             uid2sample[s.uid] = s
 
         await asyncio.gather(*[s.done_event.wait() for s in samples])
+        for s in samples:
+            if isinstance(s.output, dict) and s.output.get('type') == 'error':
+                return response.json({
+                    'status_code': -1,
+                    'status_msg': s.output['msg']
+                })
+
         output = [s.output for s in samples] if is_batched else samples[0].output
         return response.json({'status_code': 0, 'output': output, 'output_type': otype})
 
@@ -475,6 +526,7 @@ async def post_file(request: Request):
         if chat_template_kwargs := request.form.get('chat_template_kwargs'):
             preprocess_kwargs['chat_template_kwargs'] = eval(f'dict({chat_template_kwargs})')
 
+        await is_args_loaded.wait()
         added, existed = add_file_for_prediction(
             input_path,
             output_dir=output_dir,
@@ -515,6 +567,8 @@ async def get_file(request: Request):
                 'status_code': -1,
                 'status_msg': f'"{input_path}" is *NOT* in queue!'
             })
+        if request.args.get('abort'):
+            d.is_aborted = True
         return response.json({
             'status_code': 0,
             'is_done': is_file_all_done(d, written=True),
@@ -553,11 +607,57 @@ async def post_start(request: Request):
 @app.post("/terminate")
 async def post_terminate(request: Request):
     """供下游任务调用，退出推理，结束所有相关进程"""
-    info['terminated'] = True
+    if rank := request.args.get('rank'):  # 终止个别rank
+        node_info.setdefault('ranks', {}).setdefault(rank, {})['terminated'] = True
+    else:
+        info['terminated'] = True  # 全局退出
     return response.json({
         'status_code': 0,
         'status_msg': 'ok'
     })
+
+
+@app.post("/sleep")
+async def post_sleep(request: Request):
+    """供下游任务调用，退出推理，结束所有相关进程"""
+    if rank := request.args.get('rank'):  # 个别rank睡眠
+        node_info.setdefault('ranks', {}).setdefault(rank, {})['sleeping'] = True
+    else:
+        info['sleeping'] = True  # 全局睡眠
+    await wait_for_sleep_state(2, rank)
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
+
+
+@app.post("/wake_up")
+async def post_wake_up(request: Request):
+    """供下游任务调用，退出推理，结束所有相关进程"""
+    if rank := request.args.get('rank'):  # 个别rank睡眠
+        node_info.get('ranks', {}).get(rank, {}).pop('sleeping', None)
+    else:
+        info['sleeping'] = False  # 全局睡眠
+    await wait_for_sleep_state(0, rank)
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
+
+
+async def wait_for_sleep_state(sleep_state, rank=None):
+    """等待所有worker进入睡眠或唤醒状态"""
+    while True:
+        await asyncio.sleep(1)
+        rs: list[str] = [rank] if rank is not None else node_info.get('ranks', {})
+        rs: list[dict] = [node_info['ranks'][r] for r in rs]
+        ws: list[dict] = [w for r in rs for w in r.get('workers', {}).values()]
+        if not ws:  # 没有worker，继续等待（可能还在启动？）
+            continue
+        if any(len(r.get('workers', {})) != r.get('n_workers', 1) for r in rs):
+            continue
+        if all(w.get('sleep_state') == sleep_state for w in ws):
+            break
 
 
 @app.post("/restart")
@@ -570,6 +670,7 @@ async def post_restart(request: Request):
         })
     global global_args
     global_args = request.json['args']
+    is_args_loaded.clear()
     # 重置数据队列和统计信息
     node_info.clear()
     file_list.clear()
@@ -600,6 +701,34 @@ async def post_data_args(request: Request):
     })
 
 
+def should_terminate_rank(rank, check_running):
+    """用户发送信号，终止特定rank的推理进程"""
+    rank_info = node_info.get('ranks', {}).get(rank, {})
+    if rank_info.get('terminated'):
+        if not check_running:
+            return True
+        else:  # check_running: 仅当所有worker都已完成推理时才退出
+            if not any(d.get('n_queue', 0) - d.get('n_pred', 0) for d in rank_info.get('workers', {}).values()):
+                return True
+
+
+def should_throttle_worker(rank, worker_id):
+    """如果剩余样本较少，使用更严格的负载均衡策略，强制每个worker平分剩余样本"""
+    if any(d.read is None for d in file_list):  # 还有未读取的文件
+        return
+    n_remain = len(input_queue) + sum(get_num_samples(d, remaining=True) for d in file_list if not d.is_aborted)
+    if n_remain:
+        worker2running = {  # 各个worker正在处理的数量
+            (r, w): n_running
+            for r, v in node_info.get('ranks', {}).items() for w, d in v.get('workers', {}).items()
+            if (n_running := d.get('n_queue', 0) - d.get('n_pred', 0))
+        }
+        worker2running.setdefault((rank, worker_id), 0)
+        n_sample_per_worker = math.ceil((n_remain + sum(worker2running.values())) / len(worker2running))  # 剩余样本平分给各个worker
+        if n_sample_per_worker < 100 and worker2running[(rank, worker_id)] >= n_sample_per_worker:
+            return True
+
+
 def has_enough_answer_by_model(s: dict) -> bool:
     """检查choices字段下model_name对应的答案数量是否已达到限制"""
     if args.num_outputs_per_model and args.model_name:
@@ -611,6 +740,48 @@ def has_enough_answer_by_model(s: dict) -> bool:
                     if c.get('model_name') == args.model_name:
                         n += 1
         return n >= args.num_outputs_per_model
+
+
+def get_current_file() -> tuple[int, FileData]:
+    if args.file_schedule == 'fifo':
+        return get_current_file_fifo()
+    elif args.file_schedule == 'rr':
+        return get_current_file_rr()
+    else:
+        raise NotImplementedError
+
+
+def get_current_file_fifo() -> tuple[int, FileData]:
+    """返回当前正在推理的一个数据文件（先进先出调度策略）"""
+    i = info['i_pred']
+    try:
+        d = file_list[i]
+    except IndexError:
+        d = None
+    while d is None or is_file_all_read(d) or d.is_aborted:  # 当前数据（文件）已全部提交推理
+        if i < len(file_list) - 1:  # 还有其他数据文件
+            i += 1
+            info['i_pred'] = i
+            d = file_list[i]
+        else:
+            return i, None
+    return i, d
+
+
+def get_current_file_rr() -> tuple[int, FileData]:
+    """返回当前正在推理的一个数据文件（轮流调度策略）"""
+    i = info['i_pred']
+    f = None
+    for j in range(len(file_list)):
+        k = (i + j + 1) % len(file_list)
+        d = file_list[k]
+        if is_file_all_read(d) or d.is_aborted:  # 当前数据（文件）已全部提交推理
+            continue
+        else:
+            i = info['i_pred'] = k
+            f = d
+            break
+    return i, f
 
 
 def get_preprocess_func(preprocess_file: str = None, output_type: str = None, kwargs: dict = None):
@@ -823,8 +994,8 @@ def load_json_file(i_data):
                         if n_samples == n_pred > 0:  # 已全部推理完成，无需加载样本
                             d.samples.extend(None for _ in range(n_samples))
                         else:
-                            for l in f:
-                                d.samples.append(json.loads(l))
+                            for i, l in enumerate(f):
+                                d.samples.append(None if i < n_pred else json.loads(l))
                         if d.n_write == len(d.samples):  # 已有全部样本的预测结果
                             d.is_done = True
 
@@ -918,7 +1089,11 @@ def add_file_for_prediction(
                 get_postprocess_func(v)
 
         k = (f.input_path, f.output_path)  # 根据“输入-输出”去重，因为有时即使输入路径相同，也会使用不同的preprocess，输出到不同路径
-        if k in file_path2idx and not is_file_all_done(file_list[file_path2idx[k]], written=True):
+        if (
+            k in file_path2idx
+            and not is_file_all_done(d := file_list[file_path2idx[k]], written=True)
+            and not d.is_aborted
+        ):
             existed.append(f)
         else:
             file_path2idx[k] = len(file_list)
@@ -1003,6 +1178,7 @@ def parse_args():
     parser.add_argument("--no_order", action='store_true', help="Output will be written in different order than input")
     parser.add_argument("--subsample", type=float, help="proportion (0.0 - 1.0) or number (>= 1) of samples used")
     parser.add_argument("--seed", type=int, help="seed used for subsampling")
+    parser.add_argument("--file_schedule", type=str, default='fifo', choices=['fifo', 'rr'], help="Schedule strategy for files")
     parser.add_argument("--num_outputs_per_model", type=int, help="limit the number of outputs by model_name (by counting the existing answers in 'choices')")
     parser.add_argument("--chat_template", type=str, help="chat template (text or .jinja file)")
     parser.add_argument("--chat_template_kwargs", type=str, help="kwargs for apply_chat_template, e.g. enable_thinking=False")
@@ -1030,6 +1206,8 @@ def parse_args():
     if args.reasoning_parser:
         from vllm.reasoning import ReasoningParserManager
         args.reasoning_parser = ReasoningParserManager.get_reasoning_parser(args.reasoning_parser)(tokenizer)
+
+    is_args_loaded.set()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import time
 import ujson as json
 import aiohttp
 import subprocess
+import traceback
 
 from collections import OrderedDict
 
@@ -17,6 +18,12 @@ def set_device():
             os.environ['CUDA_VISIBLE_DEVICES'] = sys.argv[i + 1]
             del sys.argv[i: i + 2]
             break
+
+
+def get_local_worker_id() -> str:
+    if devices := os.getenv('CUDA_VISIBLE_DEVICES'):
+        return devices.split(',')[0]
+    return '0'
 
 
 class EngineAdaptorBase:
@@ -36,6 +43,7 @@ class EngineAdaptorBase:
         self.n_concurrent_fetch = 0
         self.idx2task = OrderedDict()
         self.r_latest = {}
+        self.worker_info = {'rank': os.getenv('RANK', 'unknown'), 'worker_id': get_local_worker_id(), 'sleep_state': 0}  # 0: not sleeping, 1: requesting sleep, 2: is sleeping, 3: requesting wake_up
         print('loading model...')
         self.load_model()
 
@@ -57,31 +65,36 @@ class EngineAdaptorBase:
         if self.n_concurrent_fetch >= self.max_concurrent_fetch:
             return
         self.n_concurrent_fetch += 1
-        query_params = {'rank': os.getenv('RANK', 'unknown')}
         n_added = 0
         while True:
             if self.should_stop_adding_sample(n_added):
                 break
             try:
-                async with self.session.get(f'{self.server_url}/data', params=query_params) as r:
+                async with self.session.get(f'{self.server_url}/data', params=self.worker_info) as r:
                     r = await r.text()
                     r = json.loads(r)
                     self.r_latest.update(r)
-                    if r['status_code'] > 0:  # 1: all done, 2: terminated
+                    await self.maybe_sleep_or_wake_up(need_sleep=(r['status_code'] == 3))
+                    if r['status_code'] > 0:  # 1: all done, 2: terminated, 3: need sleep
                         break
                     # print('add:', r['idx'])
-                    predict_coro = self.predict_sample(**self.prepare_inputs(r))
-                    self.idx2task[r['idx']] = asyncio.create_task(
-                        self.process_request(r, predict_coro),
-                        name=str(time.time())
-                    )
-                    n_added += 1
             except (
                 aiohttp.client_exceptions.ClientConnectionError,
                 asyncio.exceptions.TimeoutError
             ):
                 # print('get err')
                 await asyncio.sleep(3)
+            else:
+                try:
+                    inputs = self.prepare_inputs(r)
+                except (ValueError, TypeError, AssertionError):
+                    await self.post_result({'idx': r['idx'], 'error': traceback.format_exc()})
+                else:
+                    self.idx2task[r['idx']] = asyncio.create_task(
+                        self.process_request(r, self.predict_sample(**inputs)),
+                        name=str(time.time())
+                    )
+                    n_added += 1
 
         self.n_concurrent_fetch -= 1
 
@@ -96,22 +109,12 @@ class EngineAdaptorBase:
     async def process_request(self, inputs, predict_coro):
         """将预测完成的样本推送给data server"""
         final_output = await predict_coro
-
         idx = inputs['idx']
         # print('done:', idx)
         otype = inputs.get('output_type', self.args.output_type)
         output = self.convert_final_output(inputs, final_output, otype=otype)
         data = {'idx': idx, 'output_type': otype, 'output': output}
-
-        while True:
-            try:
-                async with self.session.post(f'{self.server_url}/result', data=json.dumps(data)) as r:
-                    r = await r.text()
-                    r = json.loads(r)
-                    break
-            except OSError:  # 有时会出现 ConnectionResetError: [Errno 104] Connection reset by peer，超过系统连接数限制？尝试再次连接
-                # traceback.print_exc()
-                await asyncio.sleep(1.)
+        await self.post_result(data)
         await self.add_sample_until_full()  # 尝试添加新样本的推理队列
         task_done = self.idx2task.pop(idx)
 
@@ -128,6 +131,39 @@ class EngineAdaptorBase:
                 输出结果的类型，支持的类型见`OUTPUT_TYPES`
         """
         return final_output
+
+    async def post_result(self, data):
+        data.update(self.worker_info)
+        while True:
+            try:
+                async with self.session.post(f'{self.server_url}/result', data=json.dumps(data)) as r:
+                    r = await r.text()
+                    break
+            except OSError:  # 有时会出现 ConnectionResetError: [Errno 104] Connection reset by peer，超过系统连接数限制？尝试再次连接
+                # traceback.print_exc()
+                await asyncio.sleep(1.)
+
+    async def maybe_sleep_or_wake_up(self, need_sleep):
+        if need_sleep:
+            if self.worker_info['sleep_state'] == 0:
+                self.worker_info['sleep_state'] = 1
+                while self.idx2task:
+                    await asyncio.sleep(1)
+                await self.sleep()
+                self.worker_info['sleep_state'] = 2
+        else:
+            if self.worker_info['sleep_state'] == 2:
+                self.worker_info['sleep_state'] = 3
+                await self.wake_up()
+                self.worker_info['sleep_state'] = 0
+
+    async def sleep(self):
+        """请求推理引擎进入睡眠，不同引擎类型需要在派生类中提供具体实现"""
+        raise NotImplementedError
+
+    async def wake_up(self):
+        """请求唤醒推理引擎，不同引擎类型需要在派生类中提供具体实现"""
+        raise NotImplementedError
 
     @staticmethod
     def get_gpu_count() -> int:

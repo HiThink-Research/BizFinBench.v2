@@ -1,6 +1,5 @@
 import os
 import sys
-import psutil
 import argparse
 import time
 import datetime
@@ -8,10 +7,11 @@ import re
 import json
 import socket
 import requests
-import signal
 import subprocess
 
-from subprocess import Popen, TimeoutExpired
+from subprocess import Popen
+
+from backend.utils import terminate_subprocess, print_subprocess_out_err, is_cpu_idle, is_gpu_idle
 
 cur_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,6 +23,8 @@ ngpus = int(subprocess.run(  # all available gpus
 cur_args : list[str] = None  # 运行中的参数
 pending_args : list[str] = None  # 需要运行的参数
 proc_data_server : Popen = None
+session = requests.Session()
+multi_node_group = {}  # 多节点模型并行的ranks和head_ip等信息
 
 
 def get_master_ip_addr(retry=10, retry_interval=10):
@@ -34,77 +36,6 @@ def get_master_ip_addr(retry=10, retry_interval=10):
             return socket.gethostbyname(master_addr)  # 将k8s域名解析为ip
         except socket.gaierror:  # 解析失败重试
             time.sleep(retry_interval)
-
-
-def terminate_subprocess(proc: Popen | psutil.Process):
-    try:
-        children = psutil.Process(proc.pid).children()
-        for child in children:
-            terminate_subprocess(child)
-    except psutil.NoSuchProcess:
-        pass
-
-    try:
-        for s in [signal.SIGINT, signal.SIGTERM]:
-            for _ in range(2):
-                try:
-                    proc.send_signal(s)
-                    proc.wait(timeout=3)
-                    return
-                except TimeoutExpired:
-                    continue
-                except psutil.NoSuchProcess:
-                    return
-        proc.kill()
-    except:
-        pass
-
-
-def print_subprocess_out_err(proc):
-    outs, errs = proc.communicate()
-    if outs:
-        print(outs.decode())
-    if errs:
-        print(errs.decode())
-
-
-def is_cpu_idle(procs: list[Popen | psutil.Process], threshold=10.):
-    """指定进程及所有子进程的CPU使用率低于阈值，则返回True"""
-    ps = []
-    for p in procs:
-        try:
-            ps.append(p := psutil.Process(p.pid))
-            ps.extend(p.children(recursive=True))
-        except psutil.NoSuchProcess:
-            pass
-    if not ps:
-        return True
-
-    # 检查3次，间隔0.5秒
-    running_status = ['running', 'disk-sleep']
-    for _ in range(3):
-        for p in ps:
-            try:
-                if p.status() in running_status or p.cpu_percent(interval=0.1) > threshold:
-                    return False
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        time.sleep(0.5)
-    return True
-
-
-def is_gpu_idle():
-    """所有GPU使用率为0，则返回True"""
-    gpu_info = os.popen('nvidia-smi | grep MiB').read().split('\n')
-    n_gpu = 0
-    n_idle = 0
-    for s in gpu_info:
-        m = re.search(r'[0-9]+%', s)
-        if m:
-            n_gpu += 1
-            if m.group(0) == '0%':
-                n_idle += 1
-    return n_gpu == n_idle
 
 
 def find_checkpoint(model_path, load_type):
@@ -147,7 +78,7 @@ def find_latest_checkpoint(model_path):
 
 
 def send_request(
-    session: requests.Session, method, url,
+    method, url,
     data=None, json=False, retry_interval=10, max_retries=10, ignore_errors=False
 ):
     """用于请求推理引擎，包括：提交文件、请求推理进度、发送终止信号"""
@@ -177,7 +108,10 @@ def run_predict_remote(args):
     调用远程inference服务
     """
     # 将数据提交至推理队列
-    session = requests.Session()
+    generation_params = {k: getattr(args, k) for k in [
+        'max_new_tokens', 'temperature', 'top_p', 'stop', 'repetition_penalty', 'presence_penalty'
+    ]}
+    generation_params['n'] = args.sample_n
     data = {
         'input_path': args.data,
         'preprocess': args.preprocess,
@@ -185,28 +119,26 @@ def run_predict_remote(args):
         'output_key': args.output_key,
         'overwrite': args.overwrite,
         'chat_template_kwargs': args.chat_template_kwargs,
-        'generation_params': json.dumps({k: getattr(args, k) for k in [
-            'max_new_tokens', 'temperature', 'top_p', 'stop', 'repetition_penalty', 'presence_penalty'
-        ]})
+        'generation_params': json.dumps(generation_params)
     }
 
     for k in ['output_dir', 'output_path']:
         if v := getattr(args, k):
             data[k] = v
     print('POST', args.model + '/file', data)
-    r = send_request(session, 'post', args.model + '/file', data).json()
+    r = send_request('post', args.model + '/file', data).json()
     assert r['status_code'] == 0, f'post file err: {r}'
     input_paths = r['input_path']
     output_paths = r['output_path']
-    t_start = time.time()
+    t_start = t_log = time.time()
     try:
         while True:
-            time.sleep(args.log_interval)
+            time.sleep(1)
             # 获取文件推理进度
             n_pred = 0
             n_done = 0
             for p0, p1 in zip(input_paths, output_paths):
-                r = send_request(session, 'get', args.model + '/file', {'input_path': p0, 'output_path': p1})
+                r = send_request('get', args.model + '/file', {'input_path': p0, 'output_path': p1})
                 try:
                     r = r.json()
                 except requests.exceptions.JSONDecodeError:
@@ -217,16 +149,22 @@ def run_predict_remote(args):
                     n_done += 1
             # 打印日志
             s_time = f'[{datetime.datetime.now().strftime("%y-%m-%d %H:%M:%S")}] '
-            print(
-                s_time + f'Finished {n_pred} samples '
-                f'({n_pred / (time.time() - t_start):.1f} samples/s, '
-                f'{n_done} files ({len(input_paths)} files in total)'
-            )
+            if time.time() - t_log >= args.log_interval:
+                t_log = time.time()
+                print(
+                    s_time + f'Finished {n_pred} samples '
+                    f'({n_pred / (time.time() - t_start):.1f} samples/s, '
+                    f'{n_done} files ({len(input_paths)} files in total)'
+                )
             if n_done == len(input_paths):
                 print(s_time + '全部预测完成!')
                 break
     except KeyboardInterrupt:  # 提前退出
-        pass
+        for p0, p1 in zip(input_paths, output_paths):
+            send_request(
+                'get', args.model + '/file', {'input_path': p0, 'output_path': p1, 'abort': '1'},
+                ignore_errors=True
+            )
 
 
 def run_predict_multi_gpu(args, engine_args: list[str]):
@@ -246,32 +184,65 @@ def run_predict_multi_gpu(args, engine_args: list[str]):
         args.device = ','.join(gpus)
 
     n_parallel = args.tensor_parallel * args.pipeline_parallel
-    assert len(gpus) * int(env.get('WORLD_SIZE', '1')) >= n_parallel, 'GPU数量不足，请确认GPU数量大于 tensor_parallel * pipeline_parallel 数值！'
+    world_size = int(env.get('WORLD_SIZE', '1'))
+    rank = os.getenv('RANK', 'unknown')
+    ranks = args.rank.split(',') if args.rank else [str(i) for i in range(world_size)]
+    is_node_0 = world_size == 1 or rank == '0'
+    is_multi_node = world_size > 1 and n_parallel > len(gpus) and not args.is_idle  # 多节点模型并行
+    use_ray = is_multi_node and args.backend == 'vllm'
 
-    is_node_0 = env.get('WORLD_SIZE', '1') == '1' or env.get('RANK', '0') == '0'
-    use_ray = args.backend == 'vllm' and int(env.get('WORLD_SIZE', '1')) > 1 and n_parallel > len(gpus)
+    if is_node_0:
+        global proc_data_server
+        proc_data_server = start_data_server(args)
+
+    if not args.is_idle:
+        assert len(gpus) * len(ranks) >= n_parallel, 'GPU数量不足，请确认GPU数量大于或等于 tensor_parallel * pipeline_parallel 数值！'
+        assert len(gpus) * len(ranks) % n_parallel == 0, 'GPU数量错误，请确认GPU数量能被 tensor_parallel * pipeline_parallel 整除！'
+        send_request(
+            'post', f'http://{args.server_addr}:{args.server_port}/node',
+            {'rank': rank, 'args': cur_args}, json=True
+        )
 
     # ------------------------- 启动 ray cluster（多机）-----------------------------
+    if is_multi_node:
+        n_nodes_per_model = n_parallel // len(gpus)
+        head_ip, local_ranks = None, None  # 如：4节点推理，tp=16，local_ranks为[0, 1]或[2, 3]
+        for i in range(0, len(ranks), n_nodes_per_model):
+            if rank in ranks[i: i + n_nodes_per_model]:
+                local_ranks = ranks[i: i + n_nodes_per_model]
+                break
+        assert local_ranks is not None, f'{rank=} {ranks=} {world_size=}'
+        print(f'multi-node model parallel: {rank=} {n_nodes_per_model=} {local_ranks=}')
+        while head_ip is None:
+            r = send_request('get', f'http://{args.server_addr}:{args.server_port}/info')
+            head_ip = r.json()['node_info'].get('ranks', {}).get(local_ranks[0], {}).get('ip')
+        multi_node_group.update(head_ip=head_ip, local_ranks=local_ranks)
+
+    start_worker = True
     if use_ray:
-        if is_node_0:
+        if rank == local_ranks[0]:
             cmd = ['ray', 'start', '--head', '--port', env['MASTER_PORT']]
         else:
-            cmd = ['ray', 'start', '--address', '{}:{}'.format(args.server_addr, env['MASTER_PORT'])]
+            cmd = ['ray', 'start', '--address', '{}:{}'.format(head_ip, env['MASTER_PORT'])]
+            start_worker = False
         cmd.extend(['--min-worker-port', '1024', '--max-worker-port', '1200'])  # 默认10002-19999，多机任务可能会导致端口冲突
         print(' '.join(cmd))
         subprocess.run(cmd, env=env)
 
     # ------------------------------ 开始推理 -------------------------------------
-    if is_node_0:
-        run_predict_master_node(args, engine_args, env)
-    else:
-        run_predict_worker_node(args, engine_args, env, use_ray)
+    try:
+        if is_node_0:
+            run_predict_master_node(args, engine_args, env)
+        else:
+            run_predict_worker_node(args, engine_args, env, start_worker)
+    except:
+        raise
+    finally:
+        if use_ray:
+            subprocess.run(['ray', 'stop'])
 
-    if use_ray:
-        subprocess.run(['ray', 'stop'])
 
-
-def start_data_server(args, session: requests.Session):
+def start_data_server(args):
     """
     启动 data server（负责数据读写）
     """
@@ -291,8 +262,8 @@ def start_data_server(args, session: requests.Session):
     if args.data:
         cmd_data_server.extend(['--data', args.data])
     for k in [
-        'output_dir', 'output_path', 'postprocess', 'max_length', 'stop', 'subsample', 'seed', 'num_outputs_per_model',
-        'chat_template', 'chat_template_kwargs', 'tool_call_parser', 'reasoning_parser'
+        'output_dir', 'output_path', 'postprocess', 'max_length', 'stop', 'subsample', 'seed', 'file_schedule',
+        'num_outputs_per_model', 'chat_template', 'chat_template_kwargs', 'tool_call_parser', 'reasoning_parser'
     ]:
         if v := getattr(args, k):
             cmd_data_server.extend([f'--{k}', str(v)])
@@ -305,21 +276,20 @@ def start_data_server(args, session: requests.Session):
     else:
         print('Reloading data server:', ' '.join(cmd_data_server[2:]))
         send_request(
-            session, 'post', f'http://{args.server_addr}:{args.server_port}/data_args',
+            'post', f'http://{args.server_addr}:{args.server_port}/data_args',
             {'args': cmd_data_server[2:]}, json=True
         )
         return proc_data_server
 
 
-def start_predict_workers(args, engine_args, env, session: requests.Session):
+def start_predict_workers(args, engine_args, env, rank):
     """
     启动推理进程（多个）
     """
     gpus = args.device.split(',')
     proc_list = []
     cmd_predict_list = []
-    is_idle = args.rank and os.getenv('RANK') and os.getenv('RANK') not in args.rank.split(',')  # 不在指定的rank（node）中，则不启动推理进程
-    for i in range(len(gpus) // min(len(gpus), args.tensor_parallel)) if not is_idle else []:
+    for i in range(len(gpus) // min(len(gpus), args.tensor_parallel)) if not args.is_idle else []:
         device = gpus[i * args.tensor_parallel : (i + 1) * args.tensor_parallel]
         cmd_predict = [
             'python', os.path.join(cur_path, 'backend', f'predict_async_{args.backend}.py'),
@@ -350,8 +320,16 @@ def start_predict_workers(args, engine_args, env, session: requests.Session):
             cmd_predict.extend(['--tensor_parallel', str(args.tensor_parallel)])
         if args.pipeline_parallel > 1:
             cmd_predict.extend(['--pipeline_parallel', str(args.pipeline_parallel)])
+        if args.backend == 'sglang' and multi_node_group:
+            cmd_predict.extend(['--head_ip', multi_node_group['head_ip']])
+            cmd_predict.extend(['--local_rank', str(multi_node_group['local_ranks'].index(rank))])
         cmd_predict.extend(engine_args)
         cmd_predict_list.append(cmd_predict)
+
+    send_request(
+        'post', f'http://{args.server_addr}:{args.server_port}/node',
+        {'rank': rank, 'n_workers': len(cmd_predict_list)}, json=True
+    )
 
     if args.manual_start:
         for cmd in cmd_predict_list:
@@ -359,11 +337,6 @@ def start_predict_workers(args, engine_args, env, session: requests.Session):
     elif cmd_predict_list:  # 启动第一个worker（其余worker延迟启动，防止多个vllm同时访问torch_compile_cache，导致异常）
         start_cmd_list([cmd_predict_list.pop(0)], env, proc_list)
 
-    if proc_list or cmd_predict_list:
-        send_request(
-            session, 'post', f'http://{args.server_addr}:{args.server_port}/node',
-            {'rank': os.getenv('RANK', 'unknown'), 'args': cur_args}, json=True
-        )
     return proc_list, cmd_predict_list
 
 
@@ -390,21 +363,19 @@ def run_predict_master_node(args, engine_args, env):
     基于vllm，启动多个推理进程（backend），并通过统一的data_server实现数据的异步读取和写入，以及推理进程之间的负载均衡。
     """
     # ------------------------ 启动 data server 和推理子进程---------------------------
-    session = requests.Session()
-    global proc_data_server
-    proc_data_server = start_data_server(args, session)
-    proc_predict_list, cmd_predict_list = start_predict_workers(args, engine_args, env, session)
+    rank =  os.getenv('RANK', 'unknown')
+    proc_predict_list, cmd_predict_list = start_predict_workers(args, engine_args, env, rank)
     proc_list = [proc_data_server] + proc_predict_list
 
     # -------------------------- 推理过程中，打印信息 -----------------------------------
     n_pred_0 = 0
-    t0 = time.time()
+    t0 = t_log = time.time()
     err = ''
     try:
         while True:
-            time.sleep(args.log_interval)
+            time.sleep(1)
             r = send_request(
-                session, 'get', f'http://{args.server_addr}:{args.server_port}/info',
+                'get', f'http://{args.server_addr}:{args.server_port}/info', {'rank': rank},
                 max_retries=0, ignore_errors=True
             )
             if r is not None:
@@ -419,12 +390,15 @@ def run_predict_master_node(args, engine_args, env):
                 tokens_per_sec = r['n_token'] / (r['t_curr'] - r['t_start'])
                 s_time = f'[{datetime.datetime.now().strftime("%y-%m-%d %H:%M:%S")}] '
                 if not args.run_forever and not r['n_pred']:
-                    print(s_time + 'loading...')
-                    if time.time() - t0 > 1800 and is_cpu_idle(proc_list[1:]):
+                    if time.time() - t_log >= args.log_interval:
+                        t_log = time.time()
+                        print(s_time + 'loading...')
+                    if time.time() - t0 > 3600 and is_cpu_idle(proc_list):
+                        print('60分钟没有加载完成，超时退出...')
                         for proc in proc_list[1:]:
                             terminate_subprocess(proc)
                             print_subprocess_out_err(proc)
-                        err = '30分钟没有加载完成，超时退出'
+                        err = '60分钟没有加载完成，超时退出'
                         break
                 if update_pending_args(r.get('global_args')):  # 下游任务发送了新的启动参数
                     break
@@ -432,11 +406,13 @@ def run_predict_master_node(args, engine_args, env):
                     pass  # 推理进程可能还没启动，不打印日志
                 else:
                     s_skipped = f', skipped {r["n_skip"]} samples >= max len' if r["n_skip"] else ''
-                    print(
-                        s_time + f'Finished {r["n_pred"]} samples '
-                        f'({samples_per_sec:.1f} samples/s, {tokens_per_sec:.1f} tokens/s{s_skipped}), '
-                        f'{r["n_done"]} files ({r["n_file"]} files in total)'
-                    )
+                    if time.time() - t_log >= args.log_interval:
+                        t_log = time.time()
+                        print(
+                            s_time + f'Finished {r["n_pred"]} samples '
+                            f'({samples_per_sec:.1f} samples/s, {tokens_per_sec:.1f} tokens/s{s_skipped}), '
+                            f'{r["n_done"]} files ({r["n_file"]} files in total)'
+                        )
                     if not args.run_forever and n_pred_0 and r['n_pred'] == n_pred_0:
                         if time.time() - t0 > 1800 and is_gpu_idle():  # 30分钟没有预测完成的样本，推理进程卡住不动？-> 检查GPU使用率
                             for proc in proc_list[1:]:
@@ -449,7 +425,7 @@ def run_predict_master_node(args, engine_args, env):
                         t0 = time.time()
                 if (
                     not args.manual_start and cmd_predict_list  # 当前节点有多个worker，第一个worker启动中，其余worker在等待
-                    and 'n_queue' in r['node_info'].get('ranks', {}).get(os.getenv('RANK', 'unknown'), {})  # 第一个worker已启动完成，启动其余worker
+                    and 'n_queue' in r['node_info'].get('ranks', {}).get(rank, {})  # 第一个worker已启动完成，启动其余worker
                 ):
                     start_cmd_list(cmd_predict_list, env, proc_list)
                 if r['post_start']:  # 下游发送启动信号（当manual_start为True时）
@@ -464,14 +440,14 @@ def run_predict_master_node(args, engine_args, env):
                 if not args.run_forever and r['n_done'] == r['n_file']:  # 全部预测完成
                     print(s_time + '全部预测完成!')
                     send_request(
-                        session, 'post', f'http://{args.server_addr}:{args.server_port}/terminate',
+                        'post', f'http://{args.server_addr}:{args.server_port}/terminate',
                         max_retries=1, ignore_errors=True
                     )
                     break
-                for proc in proc_list[1:]:  # 推理进程异常退出
+                for i, proc in enumerate(proc_list[1:]):  # 推理进程异常退出
                     if proc.poll() is not None:  # poll() -> returncode
                         print_subprocess_out_err(proc)
-                        err = '推理进程异常退出'
+                        err = f'推理进程{i}异常退出'
                 if err:
                     break
 
@@ -492,13 +468,13 @@ def run_predict_master_node(args, engine_args, env):
         raise RuntimeError(err)
 
 
-def run_predict_worker_node(args, engine_args, env, use_ray):
+def run_predict_worker_node(args, engine_args, env, start_worker):
     """
     用于多机worker节点
     """
-    session = requests.Session()
-    if not use_ray:
-        proc_predict_list, cmd_predict_list = start_predict_workers(args, engine_args, env, session)
+    rank =  os.getenv('RANK', 'unknown')
+    if start_worker:
+        proc_predict_list, cmd_predict_list = start_predict_workers(args, engine_args, env, rank)
     else:
         proc_predict_list, cmd_predict_list = [], []
 
@@ -508,7 +484,7 @@ def run_predict_worker_node(args, engine_args, env, use_ray):
         while True:
             time.sleep(check_interval)
             r = send_request(
-                session, 'get', f'http://{args.server_addr}:{args.server_port}/info',
+                'get', f'http://{args.server_addr}:{args.server_port}/info', {'rank': rank},
                 max_retries=10, ignore_errors=True
             )
             if r is None:
@@ -522,7 +498,7 @@ def run_predict_worker_node(args, engine_args, env, use_ray):
                     break
                 if (
                     not args.manual_start and cmd_predict_list  # 当前节点有多个worker，第一个worker启动中，其余worker在等待
-                    and 'n_queue' in r['node_info'].get('ranks', {}).get(os.getenv('RANK', 'unknown'), {})  # 第一个worker已启动完成，启动其余worker
+                    and 'n_queue' in r['node_info'].get('ranks', {}).get(rank, {})  # 第一个worker已启动完成，启动其余worker
                 ):
                     start_cmd_list(cmd_predict_list, env, proc_predict_list)
                 if r['post_start']:  # 下游发送启动信号（当manual_start为True时）
@@ -533,6 +509,10 @@ def run_predict_worker_node(args, engine_args, env, use_ray):
                     break
                 if r.get('error'):
                     break
+                for proc in proc_predict_list:  # 推理进程异常退出
+                    if proc.poll() is not None:  # poll() -> returncode
+                        print_subprocess_out_err(proc)
+                        break
     except KeyboardInterrupt:  # 提前退出
         pass
 
@@ -581,9 +561,11 @@ def run():
     parser.add_argument("--log_interval", type=float, default=5., help="seconds between printed logs")
     parser.add_argument("--run_forever", action='store_true', help="If not set, program will quit when there are no data to predict")
     parser.add_argument("--manual_start", action='store_true', help="If set, workers (backend) will not start automatically")
+    parser.add_argument("--is_idle", action='store_true', help="If set, workers (backend) will not start on the current node")
     parser.add_argument("--load_type", type=str, default='last', choices=['last', 'best'], help="Load the latest model or the best performing model on the validation set")
     parser.add_argument("--subsample", type=float, help="proportion (0.0 - 1.0) or number (>= 1) of samples used")
     parser.add_argument("--seed", type=int, help="seed used for subsampling")
+    parser.add_argument("--file_schedule", type=str, help="Schedule strategy for files")
     parser.add_argument("--num_outputs_per_model", type=int, help="limit the number of outputs by model_name (by counting the existing answers in 'choices')")
     parser.add_argument("--chat_template", type=str, help="chat template (text or .jinja file)")
     parser.add_argument("--chat_template_kwargs", type=str, help="kwargs for apply_chat_template, e.g. enable_thinking=False")
@@ -611,6 +593,9 @@ def run():
 
     if args.prompt == 'llama3':
         args.stop = ','.join([args.stop, '<|eot_id|>']) if args.stop else '<|eot_id|>'
+
+    if not args.is_idle and args.rank:
+        args.is_idle = (rank := os.getenv('RANK')) and rank not in args.rank.split(',')  # 不在指定的rank（node）中，则不启动推理进程
 
     if is_remote:
         run_predict_remote(args)

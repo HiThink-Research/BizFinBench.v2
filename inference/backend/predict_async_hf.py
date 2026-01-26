@@ -169,6 +169,14 @@ class HFEngineAdaptor(EngineAdaptorBase):
         for model_class in model_classes:
             try:
                 model_class = getattr(transformers, model_class)
+                # 模型类不在transformers中，尝试从自定义模型代码中加载
+                if isinstance(model_class, str):
+                    from glob import glob
+                    fs = glob(os.path.join(args.model, 'modeling_*.py'))
+                    if fs:
+                        module = os.path.basename(fs[0])[:-3]  # remove ".py"
+                        model_class = transformers.dynamic_module_utils.get_class_from_dynamic_module(
+                            f'{module}.{model_class}', args.model)
             except AttributeError:
                 continue
             try:
@@ -210,7 +218,7 @@ if __name__ == "__main__":
     parser.add_argument("--low_vram", action='store_true', help="Lower gpu memory usage")
     args = parser.parse_args()
 
-    assert args.sample_n, "sample_n > 1 not supported yet with hf backend!"
+    assert args.sample_n == 1, "sample_n > 1 not supported yet with hf backend!"
     args.stop = args.stop.replace('\\n', '\n').split(',') if args.stop else None
 
     asyncio.run(HFEngineAdaptor(args).run_predict_until_complete())

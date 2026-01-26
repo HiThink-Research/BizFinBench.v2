@@ -16,6 +16,7 @@ import time
 import ujson as json
 import requests
 import aiohttp
+import transformers
 
 from sglang.utils import launch_server_cmd, terminate_process
 
@@ -59,7 +60,7 @@ class SGlangEngineAdaptor(EngineAdaptorBase):
     def should_stop_adding_sample(self, n_added):
         return (
             n_added >= 2  # 一次最多添加 2 条样本
-            or len(self.idx2task) >= (16 if self.args.tensor_parallel < 8 else 256)  # 超过 16 条样本在队列中，暂停添加新样本（如果tp >= 8，意味着dp=1，不需要关心负载均衡，可使用更大队列长度）
+            or len(self.idx2task) >= (32 if self.args.tensor_parallel < 8 else 256)  # 超过 16 条样本在队列中，暂停添加新样本（如果tp >= 8，意味着dp=1，不需要关心负载均衡，可使用更大队列长度）
         )
 
     def prepare_inputs(self, r: dict):
@@ -118,18 +119,8 @@ class SGlangEngineAdaptor(EngineAdaptorBase):
                     for _ in range(n)
                 ])
             inputs = dict(input_ids=inputs, **params)
-            max_retries = 10
-            for i in range(max_retries):
-                try:
-                    async with self.session.post(f'http://127.0.0.1:{self.port}/generate', json=inputs) as r:
-                        r = await r.text()
-                        r = json.loads(r)
-                    break
-                except aiohttp.client_exceptions.ClientOSError:
-                    if i < max_retries - 1:
-                        await asyncio.sleep(10)
-                    else:
-                        raise
+            r = await self.send_request('generate', inputs)
+            r = json.loads(r)
             return r
 
     def convert_final_output(self, inputs: dict, final_output, otype: str):
@@ -141,6 +132,27 @@ class SGlangEngineAdaptor(EngineAdaptorBase):
             else:
                 final_output = [[token_id, logprob] for logprob, token_id, token_str in final_output]
         return final_output
+
+    async def sleep(self):
+        """请求推理引擎进入睡眠，释放显存"""
+        await self.send_request('release_memory_occupation', {})  # 需要添加启动参数：--enable-weights-cpu-backup --enable-memory-saver
+
+    async def wake_up(self):
+        """请求唤醒推理引擎，恢复显存占用"""
+        await self.send_request('resume_memory_occupation', {})
+
+    async def send_request(self, endpoint, data, max_retries=10) -> str:
+        """请求推理引擎服务"""
+        for i in range(max_retries):
+            try:
+                async with self.session.post(f'http://127.0.0.1:{self.port}/{endpoint}', json=data) as r:
+                    r = await r.text()
+                    return r
+            except aiohttp.client_exceptions.ClientOSError:
+                if i < max_retries - 1:
+                    await asyncio.sleep(10)
+                else:
+                    raise
 
     def load_model(self):
         """加载模型，启动推理引擎"""
@@ -159,20 +171,27 @@ class SGlangEngineAdaptor(EngineAdaptorBase):
         if nnodes > 1:  # 多机，e.g. 2 * 8 * H100 启动DeepSeek-R1时，tp=16
             # 修复多节点加载模型超时的问题
             import sglang
-            subprocess.run(f'sed -i s/\'UNBALANCED_MODEL_LOADING_TIMEOUT_S = 300\'/'
+            subprocess.run(f'sed -i s/\'UNBALANCED_MODEL_LOADING_TIMEOUT_S = .\+\'/'
                         f'\'UNBALANCED_MODEL_LOADING_TIMEOUT_S = 1800\'/g '
                         f'{os.path.join(sglang.__path__[0], "srt/model_executor/model_runner.py")}', shell=True)
 
             cmd.extend([
-                '--dist-init-addr', ':'.join([args.server_addr, os.environ['MASTER_PORT']]),
+                '--dist-init-addr', ':'.join([args.head_ip, '1033']),
                 '--nnodes', str(nnodes),
-                '--node-rank', os.environ['RANK'],
+                '--node-rank', args.local_rank,
                 '--dist-timeout', str(timeout),
                 '--enable-dp-attention',  # 提升高并发下的吞吐 https://docs.sglang.ai/references/deepseek.html#data-parallelism-attention
                 '--dp', str(nnodes),
             ])
-            if os.environ['RANK'] != '0':
+            if args.local_rank != '0':
                 self.is_worker_node = True
+
+        config = transformers.AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        if (
+            'DeepseekV3ForCausalLM' in getattr(config, "architectures", []) and tp == 16  # sglang默认显存占用比较保守，尽量用满显存以优化吞吐
+            and '--mem-fraction-static' not in self.additional_args
+        ):
+            cmd.extend(['--mem-fraction-static', '0.82'])
 
         cmd.extend(['--tp', str(tp)])
         if args.max_length is not None:
@@ -188,7 +207,7 @@ class SGlangEngineAdaptor(EngineAdaptorBase):
         try:
             while True:
                 try:
-                    if not os.popen(f'ps auxww | grep sglang.launch_server | grep "\-\-port {self.port}" | grep -v grep').read():
+                    if self.server_proc.poll() is not None:  # poll() -> returncode
                         raise RuntimeError('SGLang启动异常')
                     if self.is_worker_node:
                         break
@@ -211,6 +230,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, required=True, help="Model file path")
     parser.add_argument("--server_addr", type=str, required=True, help="Data server address")
     parser.add_argument("--server_port", type=int, required=True, help="Data server port")
+    parser.add_argument("--head_ip", type=str, help="IP of the head node in a multi-node group")
+    parser.add_argument("--local_rank", type=str, help="rank of the current node in a multi-node group")
     parser.add_argument("--output_type", type=str, default='text', choices=OUTPUT_TYPES, help="Output type")
     parser.add_argument("--max_length", type=int, default=None, help="Max number of tokens (input and output)")
     parser.add_argument("--max_new_tokens", type=int, default=2048, help="Max number of tokens to generate")

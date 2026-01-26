@@ -1,5 +1,7 @@
+import io
 import math
 import librosa
+from urllib.parse import urlparse
 from PIL import Image
 
 
@@ -24,7 +26,7 @@ def load_multimodal_data(
     return_dict=False,
 ):
     if image is not None:
-        image = [Image.open(x) for x in image]
+        image = [load_image(x) for x in image]
         image = [to_rgb(x) for x in image]
         # For Qwen2-VL, Qwen2.5-VL, Omni, 解决processor短边小于28的bug
         # OCRBench数据集需要调整，MIN_PIXELS
@@ -41,6 +43,25 @@ def load_multimodal_data(
         return {k: v for k, v in [('image', image), ('audio', audio)] if v is not None}
     else:
         return image, audio
+
+
+def load_image(url: str) -> Image:
+    url_spec = urlparse(url)
+    if url_spec.scheme.startswith('http'):
+        raise NotImplementedError('多模态数据暂不支持http路径')
+    elif url_spec.scheme == 'data':
+        image = Image.open(load_base64_data(url_spec.path))
+    else:
+        image = Image.open(url)
+    return image
+
+
+def load_base64_data(path: str) -> io.BytesIO:
+    import pybase64
+    data_spec, data = path.split(',', 1)
+    media_type, data_type = data_spec.split(';', 1)
+    assert data_type == 'base64'
+    return io.BytesIO(pybase64.b64decode(data))
 
 
 def to_rgb(pil_image: Image.Image) -> Image.Image:
