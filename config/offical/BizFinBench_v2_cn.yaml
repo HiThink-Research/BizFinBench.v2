@@ -44,7 +44,7 @@ tasks:
         type: text
         data_path: datasets/cn/event_logic_reasoning_cn.jsonl
         compare_func:
-            path: benchmark_code/BizFinBench.v2/eval_financial_logic_event.py
+            path: benchmark_code/BizFinBench.v2/eval_event_logic_reasoning.py
     conterfactual_cn:
         type: text
         data_path: datasets/cn/conterfactual_cn.jsonl
@@ -59,4 +59,9 @@ tasks:
         type: text
         data_path: datasets/cn/user_sentiment_analysis_cn.jsonl
         compare_func:
-            path: benchmark_code/BizFinBench.v2/eval_emotion.py
+            path: benchmark_code/BizFinBench.v2/eval_user_sentiment_analysis.py
+    financial_report_analysis_cn:
+        type: text
+        data_path: datasets/cn/financial_report_analysis.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_report_analysis.py
