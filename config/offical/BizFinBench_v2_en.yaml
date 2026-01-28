@@ -2,7 +2,7 @@
 save_dir: eval_result/en
 
 # testsets subsample (Optional)
-subsample: 5
+# subsample: 5
 # seed: 1235
 
 # inference engine params (Optional)
