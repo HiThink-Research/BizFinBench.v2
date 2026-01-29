@@ -195,3 +195,4 @@ config*.yaml
 inference/out/
 infer_result/
 testsets/
+datasets/

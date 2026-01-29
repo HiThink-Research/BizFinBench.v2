@@ -1,0 +1,67 @@
+# where to save your prediect result
+save_dir: eval_result/cn
+
+# testsets subsample (Optional)
+# subsample: 5
+# seed: 1235
+
+# inference engine params (Optional)
+# backend: hf
+# temperature: 0.6
+# preprocess: preprocess_no_think
+# max_length: 32768
+# max_new_tokens: 4096
+# load_type: last
+# engine_args: "--kv-cache-dtype fp8_e5m2  --quantization awq_marlin"
+# tensor_parallel: 2
+# judge_tensor_parallel: 4
+# judge_max_length: 65536
+# judge_max_new_tokens: 4096
+
+
+tasks:
+    anomaly_information_tracing_cn:
+        type: text
+        data_path: datasets/cn/anomaly_information_tracing_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_anomaly_information_tracing.py
+    financial_quantitative_computation_cn:
+        type: text
+        data_path: datasets/cn/financial_quantitative_computation_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_quantitative_computation.py
+    financial_data_description_cn:
+        type: text
+        data_path: datasets/cn/financial_data_description_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_data_description.py
+    financial_multi-turn_perception_cn:
+        type: text
+        data_path: datasets/cn/financial_multi-turn_perception_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_multi-turn_perception.py
+    event_logic_reasoning_cn:
+        type: text
+        data_path: datasets/cn/event_logic_reasoning_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_event_logic_reasoning.py
+    conterfactual_cn:
+        type: text
+        data_path: datasets/cn/conterfactual_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_quantitative_computation.py
+    stock_price_predict_cn:
+        type: text
+        data_path: datasets/cn/stock_price_predict_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_stock_price_predict.py
+    user_sentiment_analysis_cn:
+        type: text
+        data_path: datasets/cn/user_sentiment_analysis_cn.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_user_sentiment_analysis.py
+    financial_report_analysis_cn:
+        type: text
+        data_path: datasets/cn/financial_report_analysis.jsonl
+        compare_func:
+            path: benchmark_code/BizFinBench.v2/eval_financial_report_analysis.py

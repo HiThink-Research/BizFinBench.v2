@@ -1,32 +1,41 @@
 import os
+import sys
 import argparse
 import random
 import ujson as json
 import asyncio
 import time
 import importlib
+import inspect
 import traceback
+import uuid
+import math
 import datasets
 
 from collections import deque
 from dataclasses import dataclass, field
+from functools import partial
 from transformers import AutoProcessor, PreTrainedTokenizer
 from sanic import Sanic, response
 from sanic.request import Request
 from typing import Callable, List, Dict, Deque, Optional, Union
 
 
-OUTPUT_TYPES = ['text', 'reward', 'loss', 'prompt_tokens', 'next_token_prob']
+OUTPUT_TYPES = ['text', 'reward', 'loss', 'prompt_tokens', 'next_token_prob', 'embedding', 'retrieval', 'cosyvoice2', 'turn_taking']
 
 app = Sanic("DataServer")
 app.config.RESPONSE_TIMEOUT = 60 * 60 * 24  # 24 hours
 
+global_args: list[str] = None
+data_args : list[str] = sys.argv[1:]
+is_args_loaded = asyncio.Event()  # 确保参数已加载后再处理请求
+node_info: dict = {}  # 各个节点的运行状态
+
 args: argparse.Namespace = None
-postprocess: Callable = None
 tokenizer: PreTrainedTokenizer = None
 stop: str = None
-preprocess: str = None
 preprocessors: Dict[str, Callable] = {}  # preprocess -> convert_sample_to_inputs
+postprocessors: Dict[str, Callable] = {}
 
 info = {  # 全局信息
     'i_pred': 0,   # 当前预测的data序号
@@ -40,6 +49,7 @@ info = {  # 全局信息
     't_curr': 0.,   # 当前的时间戳
     'error': 0,
     'terminated': False,  # 下游发送终止信号
+    'sleeping': False,  # 下游发送睡眠信号
     'post_start': False  # 下游发送启动信号
 }
 
@@ -50,6 +60,8 @@ class FileData:
     output_path: str  # './output/a.json'
     file_type: str = 'jsonl'
     preprocess: Optional[str] = None
+    postprocess: Optional[str] = None
+    output_type: Optional[str] = None
     output_key: Optional[str] = None
     samples: Optional[List[dict]] = None
     results: Optional[List[dict]] = None
@@ -62,7 +74,10 @@ class FileData:
     write: tuple[asyncio.Semaphore, dict[int, asyncio.Task]] = field(
         default_factory=lambda : (asyncio.Semaphore(), {})
     )
+    overwrite: bool = None
     is_done: bool = False  # 已完成预测并写入结果
+    is_aborted: bool = False  # 下游请求终止文件推理
+    preprocess_kwargs: Optional[dict] = None
     generation_params: Optional[dict] = None
 
 
@@ -71,6 +86,7 @@ class Sample:
     inputs: list[int] | dict
     output_type: Optional[str] = None
     output: Optional[Union[str, float, dict]] = None
+    generation_params: Optional[dict] = None
     next_token_ids: Optional[List[int]] = None  # only used when output_type == 'next_token_prob'
     uid: str = field(default_factory=lambda : str(time.time()))
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -83,19 +99,33 @@ input_queue: Deque[Sample] = deque()  # 通过HTTP请求添加的待预测样本
 uid2sample: Dict[str, Sample] = {}
 
 
+def is_all_done():
+    """所有推理都已完成（包括文件和HTTP请求的样本）"""
+    return len(file_list) == get_num_done() and not uid2sample
+
+
 def is_file_all_read(d: FileData):
     """判断数据（文件）是否已全部读取并提交推理"""
-    return d.read is not None and d.read.done() and d.j_pred == len(
-        d.samples if args.subsample is None else d.subsample_ids
-    )
+    return d.read is not None and d.read.done() and d.j_pred >= get_num_samples(d)
 
 
 def is_file_all_done(d: FileData, written=False):
     """判断数据（文件）是否已全部完成推理"""
+    if d.is_done:
+        return True
     n_curr = d.n_write if written else d.n_pred
-    return d.read is not None and d.read.done() and n_curr == len(
-        d.samples if args.subsample is None else d.subsample_ids
-    )
+    return d.read is not None and d.read.done() and n_curr >= get_num_samples(d)
+
+
+def get_num_samples(d: FileData, remaining=False):
+    """返回单个文件需要推理的样本数量"""
+    samples = d.samples if args.subsample is None else d.subsample_ids
+    n_total = len(samples) if samples else 0
+    if remaining:
+        n_remain = max(0, n_total - d.j_pred)
+        return n_remain
+    else:
+        return n_total
 
 
 def get_num_done():
@@ -114,21 +144,64 @@ async def get_info(request: Request):
     """供主进程（`predict_multi_gpu.py`）调用，返回全局信息，包括已完成的样本/文件数量等"""
     info['n_file'] = len(file_list)
     info['n_done'] = get_num_done()
-    info['n_queue'] = sum(d.j_pred for d in file_list[:info['i_pred'] + 1])
-    info['n_read'] = sum(1 for d in file_list[:info['i_pred'] + 1] if is_file_all_read(d))
+    info['n_queue'] = sum(d.j_pred for d in file_list)
+    info['n_read'] = sum(1 for d in file_list if is_file_all_read(d))
     info['t_curr'] = time.time()
-    return response.json(info)
+    info['node_info'] = node_info
+    if global_args:
+        info['global_args'] = global_args
+    r = info
+    if (rank := request.args.get('rank')) and should_terminate_rank(rank, check_running=True):
+        r = r.copy()
+        r['terminated'] = True
+    return response.json(r)
+
+
+@app.post("/node")
+async def post_node(request: Request):
+    """供主进程（`predict_multi_gpu.py`）调用，传入节点信息"""
+    rank = request.json['rank']
+    node_info.setdefault('ranks', {}).setdefault(rank, {'ip': request.client_ip})
+    if (n_workers := request.json.get('n_workers')) is not None:
+        node_info['ranks'][rank]['n_workers'] = n_workers
+    if global_args and (args := request.json.get('args')) is not None:
+        if ' '.join(global_args) != ' '.join(args):
+            info['error'] += 1
+            raise ValueError(f'global_args mismatch! server={global_args} client={request.json["args"]}')
+
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
 
 
 @app.get("/data")
 async def get_data(request: Request):
     """供worker（predict_async.py）调用，返回待预测的inputs"""
     try:
+        if (
+            (rank := request.args.get('rank')) not in node_info.get('ranks', {})  # node_info中不包含当前rank，说明是旧的推理worker（等待重启）
+            or should_terminate_rank(rank, check_running=False)  # 用户发送终止rank的信号
+        ):
+            return response.json({'status_code': 1})
+        else:
+            rank_info = node_info['ranks'][rank]
+            rank_info.setdefault('n_queue', 0)  # 模型加载完成信号
+            worker_id = request.args.get('worker_id')
+            worker_info = rank_info.setdefault('workers', {}).setdefault(worker_id, {})
+            if (ss := request.args.get('sleep_state')) is not None:
+                worker_info['sleep_state'] = int(ss)
+
         if info['terminated']:
             return response.json({'status_code': 2, 'status_msg': 'terminated'})
+        elif info['sleeping'] or rank_info.get('sleeping'):
+            return response.json({'status_code': 3, 'status_msg': 'sleeping'})
 
         if not info['t_start']:
             info['t_start'] = time.time()
+
+        if should_throttle_worker(rank, worker_id):
+            return response.json({'status_code': 1})
 
         while input_queue:
             s = input_queue.popleft()
@@ -141,26 +214,19 @@ async def get_data(request: Request):
                 'status_code': 0,
                 'inputs': s.inputs,
                 'output_type': s.output_type,
+                'generation_params': s.generation_params or {},
                 'idx': s.uid
             }
             if s.next_token_ids is not None:
                 r['next_token_ids'] = s.next_token_ids
+            rank_info['n_queue'] = rank_info.get('n_queue', 0) + 1
+            worker_info['n_queue'] = worker_info.get('n_queue', 0) + 1
             return response.json(r)
 
         while True:
-            i = info['i_pred']
-            try:
-                d = file_list[i]
-            except IndexError:
-                d = None
-            if d is None or is_file_all_read(d):  # 当前数据（文件）已全部提交推理
-                if i < len(file_list) - 1:  # 还有其他数据文件
-                    i += 1
-                    info['i_pred'] = i
-                    d = file_list[i]
-                else:
-                    # print('get: all done!')
-                    return response.json({'status_code': 1})
+            i, d = get_current_file()
+            if d is None:
+                return response.json({'status_code': 1})  # all done!
 
             if d.read is None:  # 开始读取数据（异步）
                 d.read = asyncio.get_running_loop().run_in_executor(
@@ -176,14 +242,18 @@ async def get_data(request: Request):
             d.j_pred = idx + 1
 
             output_key = d.output_key or args.output_key
-            if args.reuse and (s.get(output_key) and not s[output_key].startswith('ERROR')):
+            if (  # 跳过已有推理结果的样本
+                has_enough_answer_by_model(s)
+                or (args.reuse and (s.get(output_key) and not s[output_key].startswith('ERROR')))
+            ):
                 set_result(i, idx, s)
                 continue
 
             # print('get:', d.input_path, idx)
-
-            convert_sample_to_inputs = get_preprocess_func(d.preprocess)
-            inputs = convert_sample_to_inputs(s, args.prompt, tokenizer)
+            kwargs = d.preprocess_kwargs or {}
+            kwargs['data_path'] = d.input_path  # 用于加载多模态数据
+            convert_sample_to_inputs, kwargs = get_preprocess_func(d.preprocess, output_type=d.output_type, kwargs=kwargs)
+            inputs = convert_sample_to_inputs(s, args.prompt, tokenizer, **kwargs)
             if args.max_length and isinstance(inputs, list) and inputs and isinstance(inputs[0], int) and len(inputs) >= args.max_length:
                 r = s.copy()
                 r[output_key] = ''
@@ -194,12 +264,14 @@ async def get_data(request: Request):
             r = {
                 'status_code': 0,
                 'inputs': inputs,
-                'output_type': args.output_type,
+                'output_type': d.output_type,
                 'idx': '_'.join([str(i), str(idx)]),
                 'generation_params': d.generation_params or {},
             }
             if 'max_new_tokens' in s:  # 支持针对单条样本设置生成长度
                 r['generation_params']['max_new_tokens'] = s['max_new_tokens']
+            rank_info['n_queue'] = rank_info.get('n_queue', 0) + 1
+            worker_info['n_queue'] = worker_info.get('n_queue', 0) + 1
             return response.json(r)
     except:
         info['error'] += 1
@@ -210,14 +282,19 @@ async def get_data(request: Request):
 async def post_result(request: Request):
     """供worker（predict_async.py）调用，传入预测结果"""
     try:
-        otype = request.json['output_type']
-        output = request.json['output']
-        if otype in ['text', 'beam_search']:
-            output = convert_output_ids_to_text(output)
-        elif otype == 'reward':
-            if isinstance(output, dict):
-                output['rewards'] = [round(s, 4) for s in output['rewards']]
-                output['gating_output'] = [round(s, 4) for s in output['gating_output']]
+        if e := request.json.get('error'):
+            output = {'type': 'error', 'msg': e}
+        else:
+            otype = request.json['output_type']
+            output = request.json['output']
+            if otype in ['text', 'beam_search']:
+                output = convert_output_to_text(output)
+            elif otype == 'next_token_prob':
+                output = [[decode([token_id]), logprob] for token_id, logprob in output]
+            elif otype == 'reward':
+                if isinstance(output, dict):
+                    output['rewards'] = [round(s, 4) for s in output['rewards']]
+                    output['gating_output'] = [round(s, 4) for s in output['gating_output']]
 
         idx = request.json['idx']
         # print('post:', idx)
@@ -228,13 +305,24 @@ async def post_result(request: Request):
         else:
             i_data, i_sample = map(int, idx.split('_'))
             d = file_list[i_data]
-            r = d.samples[i_sample if args.subsample is None else d.subsample_ids[i_sample]].copy()
+            i = i_sample if args.subsample is None else d.subsample_ids[i_sample]
+            r = d.samples[i]
+            if isinstance(d.samples, list):  # 释放内存（如果是Dataset则不允许修改）
+                d.samples[i] = None
             output_key = d.output_key or args.output_key
             r[output_key] = output
             set_result(i_data, i_sample, r)
-            d.write[1][i_sample] = asyncio.create_task(write_result_async(i_data, i_sample))
+            if isinstance(output, dict) and output.get('type') == 'error':
+                print(output['msg'])
+                info['error'] += 1
         info['n_pred'] += 1
-        if info['terminated']:
+        rank = request.json.get('rank')
+        if (rank_info := node_info.get('ranks', {}).get(rank)) is not None:
+            worker_info = rank_info.setdefault('workers', {}).setdefault(request.json.get('worker_id'), {})
+            rank_info['n_pred'] = rank_info.get('n_pred', 0) + 1
+            worker_info['n_pred'] = worker_info.get('n_pred', 0) + 1
+            worker_info['sleep_state'] = request.json.get('sleep_state')
+        if info['terminated'] or should_terminate_rank(rank, check_running=True):
             return response.json({'status_code': 2, 'status_msg': 'terminated'})
         else:
             return response.json({'status_code': 0})
@@ -243,14 +331,123 @@ async def post_result(request: Request):
         raise
 
 
+@app.post("/v1/chat/completions")
+async def openai_v1_chat_completions(request: Request):
+    """兼容OpenAI协议的API"""
+    try:
+        messages = request.json.get('messages')
+        uid = f'chatcmpl-{str(uuid.uuid4().hex)}'
+        otype = 'text'
+        t0 = time.time()
+
+        sample = {'messages': messages}
+        if (tools := request.json.get('tools') or request.json.get('functions')):
+            sample['tools'] = tools
+        tool_choice = request.json.get('tool_choice') or request.json.get('function_call') \
+            or ('auto' if tools else 'none')
+
+        kwargs = {}
+        if chat_template_kwargs := request.json.get('chat_template_kwargs'):
+            kwargs['chat_template_kwargs'] = chat_template_kwargs
+        if reasoning_effort := request.json.get('reasoning_effort'):
+            kwargs.setdefault('chat_template_kwargs', {})['reasoning_effort'] = reasoning_effort
+        await is_args_loaded.wait()
+        convert_sample_to_inputs, kwargs = get_preprocess_func(output_type=otype, kwargs=kwargs)
+        inputs = convert_sample_to_inputs(sample, args.prompt, tokenizer, **kwargs)
+
+        generation_params = dict(
+            n=request.json.get('n'),
+            max_new_tokens=request.json.get('max_completion_tokens') or request.json.get('max_tokens'),
+            temperature=request.json.get('temperature'),
+            top_p=request.json.get('top_p'),
+            stop=request.json.get('stop'),
+            repetition_penalty=request.json.get('repetition_penalty'),
+            presence_penalty=request.json.get('presence_penalty'),
+        )
+        generation_params = {k: v for k, v in generation_params.items() if v is not None}
+
+        s = Sample(
+            inputs=inputs,
+            output_type=otype,
+            generation_params=generation_params,
+            uid=uid,
+        )
+        input_queue.append(s)
+        uid2sample[s.uid] = s
+
+        await s.done_event.wait()
+        if isinstance(s.output, dict) and s.output.get('type') == 'error':
+            return response.json({
+                'object': 'error',
+                'code': -1,
+                'message': s.output['msg']
+            })
+
+        outputs = s.output if isinstance(s.output, list) else [s.output]
+        choices = []
+        for i, o in enumerate(outputs):
+            c = {
+                "index": i,
+                "message": {
+                    "role": "assistant",
+                    "content": o,
+                },
+            }
+            content = o if o is not None else ""
+            if args.reasoning_parser:
+                reasoning_content, content = args.reasoning_parser.extract_reasoning_content(content, request=None)
+                c['message'].update(
+                    reasoning_content=reasoning_content,
+                    content=content,
+                )
+            if tool_choice != 'none' and args.tool_call_parser:
+                tc = args.tool_call_parser.extract_tool_calls(content, request=None)
+                if tc.tools_called:
+                    c['message'].update(
+                        content=tc.content,
+                        tool_calls=[t.model_dump() for t in tc.tool_calls],
+                    )
+            choices.append(c)
+
+        return response.json({
+            "id": uid,
+            "object": "chat.completion",
+            "created": int(t0),
+            "model": request.json.get('model'),
+            "choices": choices,
+        })
+
+    except:
+        return response.json({
+            'object': 'error',
+            'code': -1,
+            'message': traceback.format_exc()
+        })
+
+
 @app.post("/model")
 async def post_inputs(request: Request):
     """供下游任务调用，传入待预测的样本"""
     try:
-        prompt = request.json.get('prompt')
+        prompt : dict | str = request.json.get('prompt')
+        otype = request.json.get('output_type')
+        if otype is None:
+            otype = args.output_type
+        elif otype not in OUTPUT_TYPES:
+            return response.json({
+                'status_code': -1,
+                'status_msg': f'"output_type" must be one of {OUTPUT_TYPES}!'
+            })
+
         if prompt:
-            convert_sample_to_inputs = get_preprocess_func()
-            inputs = convert_sample_to_inputs(prompt, args.prompt, tokenizer)
+            if isinstance(prompt, str):
+                prompt = {'messages': [{'role': 'user', 'content': prompt}]}
+            kwargs = request.json.get('preprocess_kwargs') or {}
+            if chat_template_kwargs := request.json.get('chat_template_kwargs'):
+                kwargs['chat_template_kwargs'] = chat_template_kwargs
+            await is_args_loaded.wait()
+            convert_sample_to_inputs, kwargs = get_preprocess_func(output_type=otype, kwargs=kwargs)
+            inputs = convert_sample_to_inputs(prompt, args.prompt, tokenizer, **kwargs)
         else:
             inputs = request.json.get('inputs')
         if not inputs:
@@ -264,20 +461,12 @@ async def post_inputs(request: Request):
         else:
             is_batched = True
 
-        otype = request.json.get('output_type')
-        if otype is None:
-            otype = args.output_type
-        elif otype not in OUTPUT_TYPES:
-            return response.json({
-                'status_code': -1,
-                'status_msg': f'"output_type" must be one of {OUTPUT_TYPES}!'
-            })
-
         samples = []
         for inputs_i in inputs:
             s = Sample(
                 inputs=inputs_i,
                 output_type=otype,
+                generation_params=request.json.get('generation_params'),
                 next_token_ids=request.json.get('next_token_ids') if otype == 'next_token_prob' else None
             )
             samples.append(s)
@@ -285,12 +474,21 @@ async def post_inputs(request: Request):
             uid2sample[s.uid] = s
 
         await asyncio.gather(*[s.done_event.wait() for s in samples])
+        for s in samples:
+            if isinstance(s.output, dict) and s.output.get('type') == 'error':
+                return response.json({
+                    'status_code': -1,
+                    'status_msg': s.output['msg']
+                })
+
         output = [s.output for s in samples] if is_batched else samples[0].output
         return response.json({'status_code': 0, 'output': output, 'output_type': otype})
 
     except:
-        info['error'] += 1
-        raise
+        return response.json({
+            'status_code': -1,
+            'status_msg': traceback.format_exc()
+        })
 
 
 @app.post("/file")
@@ -305,33 +503,47 @@ async def post_file(request: Request):
             })
         output_dir = request.form.get('output_dir')
         output_path = request.form.get('output_path')
-        generation_params = request.form.get('generation_params')
+        output_type = request.form.get('output_type')
+        if output_type is None:
+            output_type = args.output_type
+        overwrite = request.form.get('overwrite')
+        if isinstance(overwrite, str):
+            overwrite = eval(overwrite)
         if not (output_dir or output_path):
             return response.json({
                 'status_code': -1,
                 'status_msg': f'"output_dir" or "output_path" is missing!'
             })
+        if output_type not in OUTPUT_TYPES:
+            return response.json({
+                'status_code': -1,
+                'status_msg': f'"output_type" must be one of {OUTPUT_TYPES}!'
+            })
+        if preprocess_kwargs := request.form.get('preprocess_kwargs'):
+            preprocess_kwargs = json.loads(preprocess_kwargs)
+        else:
+            preprocess_kwargs = {}
+        if chat_template_kwargs := request.form.get('chat_template_kwargs'):
+            preprocess_kwargs['chat_template_kwargs'] = eval(f'dict({chat_template_kwargs})')
+
+        await is_args_loaded.wait()
         added, existed = add_file_for_prediction(
             input_path,
             output_dir=output_dir,
             output_path=output_path,
-            generation_params=generation_params,
+            overwrite=overwrite,
+            output_type=output_type,
+            preprocess_kwargs=preprocess_kwargs,
+            generation_params=request.form.get('generation_params'),
+            preprocess=request.form.get('preprocess'),
+            postprocess=request.form.get('postprocess'),
+            output_key=request.form.get('output_key'),
         )
-
-        p = request.form.get('preprocess')
-        if p:
-            get_preprocess_func(p)
-            for d in added:
-                d.preprocess = p
-
-        v = request.form.get('output_key')
-        if v:
-            for d in added:
-                d.output_key = v
 
         return response.json({
             'status_code': 0,
             'n_added': len(added),
+            'input_path': [d.input_path for d in (added + existed)],
             'output_path': [d.output_path for d in (added + existed)]
         })
     except:
@@ -355,10 +567,12 @@ async def get_file(request: Request):
                 'status_code': -1,
                 'status_msg': f'"{input_path}" is *NOT* in queue!'
             })
+        if request.args.get('abort'):
+            d.is_aborted = True
         return response.json({
             'status_code': 0,
             'is_done': is_file_all_done(d, written=True),
-            'n_samples': len(d.samples) if d.samples else 0,
+            'n_samples': len(d.samples or []) if args.subsample is None else len(d.subsample_ids or []),
             'n_pred': d.n_pred,
         })
     except:
@@ -393,33 +607,238 @@ async def post_start(request: Request):
 @app.post("/terminate")
 async def post_terminate(request: Request):
     """供下游任务调用，退出推理，结束所有相关进程"""
-    info['terminated'] = True
+    if rank := request.args.get('rank'):  # 终止个别rank
+        node_info.setdefault('ranks', {}).setdefault(rank, {})['terminated'] = True
+    else:
+        info['terminated'] = True  # 全局退出
     return response.json({
         'status_code': 0,
         'status_msg': 'ok'
     })
 
 
-def get_preprocess_func(preprocess_file: str = None):
-    if preprocess_file is None:
-        preprocess_file = preprocess
-    if preprocess_file not in preprocessors:
-        module = importlib.import_module(preprocess_file)
-        assert args.prompt in module.PROMPT, f'Can not find prompt type "{args.prompt}" in module "{preprocess_file}"!'
-        f = getattr(module, 'convert_sample_to_input_ids')
-        preprocessors[preprocess_file] = f
-    return preprocessors[preprocess_file]
+@app.post("/sleep")
+async def post_sleep(request: Request):
+    """供下游任务调用，退出推理，结束所有相关进程"""
+    if rank := request.args.get('rank'):  # 个别rank睡眠
+        node_info.setdefault('ranks', {}).setdefault(rank, {})['sleeping'] = True
+    else:
+        info['sleeping'] = True  # 全局睡眠
+    await wait_for_sleep_state(2, rank)
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
 
 
-def convert_output_ids_to_text(output_ids):
-    """将推理输出的token ids转换为文本"""
-    if not output_ids:  # 推理无结果（输入超过模型最大长度？）
+@app.post("/wake_up")
+async def post_wake_up(request: Request):
+    """供下游任务调用，退出推理，结束所有相关进程"""
+    if rank := request.args.get('rank'):  # 个别rank睡眠
+        node_info.get('ranks', {}).get(rank, {}).pop('sleeping', None)
+    else:
+        info['sleeping'] = False  # 全局睡眠
+    await wait_for_sleep_state(0, rank)
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
+
+
+async def wait_for_sleep_state(sleep_state, rank=None):
+    """等待所有worker进入睡眠或唤醒状态"""
+    while True:
+        await asyncio.sleep(1)
+        rs: list[str] = [rank] if rank is not None else node_info.get('ranks', {})
+        rs: list[dict] = [node_info['ranks'][r] for r in rs]
+        ws: list[dict] = [w for r in rs for w in r.get('workers', {}).values()]
+        if not ws:  # 没有worker，继续等待（可能还在启动？）
+            continue
+        if any(len(r.get('workers', {})) != r.get('n_workers', 1) for r in rs):
+            continue
+        if all(w.get('sleep_state') == sleep_state for w in ws):
+            break
+
+
+@app.post("/restart")
+async def post_restart(request: Request):
+    """供下游任务调用，更新全局args，用于重启推理进程（更换模型/推理参数）"""
+    if not is_all_done():
+        return response.json({
+            'status_code': -1,
+            'status_msg': 'Restart not allowed, inference is still running!'
+        })
+    global global_args
+    global_args = request.json['args']
+    is_args_loaded.clear()
+    # 重置数据队列和统计信息
+    node_info.clear()
+    file_list.clear()
+    file_path2idx.clear()
+    for k, v in info.items():
+        if isinstance(v, int):
+            info[k] = 0
+        elif isinstance(v, bool):
+            info[k] = False
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
+
+
+@app.post("/data_args")
+async def post_data_args(request: Request):
+    """供主进程（`predict_multi_gpu.py`）调用，更新并加载data_args"""
+    try:
+        data_args[:] = request.json['args']
+        parse_args()
+    except:
+        info['error'] += 1
+        raise
+    return response.json({
+        'status_code': 0,
+        'status_msg': 'ok'
+    })
+
+
+def should_terminate_rank(rank, check_running):
+    """用户发送信号，终止特定rank的推理进程"""
+    rank_info = node_info.get('ranks', {}).get(rank, {})
+    if rank_info.get('terminated'):
+        if not check_running:
+            return True
+        else:  # check_running: 仅当所有worker都已完成推理时才退出
+            if not any(d.get('n_queue', 0) - d.get('n_pred', 0) for d in rank_info.get('workers', {}).values()):
+                return True
+
+
+def should_throttle_worker(rank, worker_id):
+    """如果剩余样本较少，使用更严格的负载均衡策略，强制每个worker平分剩余样本"""
+    if any(d.read is None for d in file_list):  # 还有未读取的文件
         return
-    if not isinstance(output_ids[0], list):  # output_ids: list[int]
-        info['n_token'] += len(output_ids) + 1
-        return remove_stop_str(tokenizer.decode(output_ids, skip_special_tokens=True), stop).strip()
-    else:  # output_ids: list[list[int]]
-        return [convert_output_ids_to_text(o) for o in output_ids]
+    n_remain = len(input_queue) + sum(get_num_samples(d, remaining=True) for d in file_list if not d.is_aborted)
+    if n_remain:
+        worker2running = {  # 各个worker正在处理的数量
+            (r, w): n_running
+            for r, v in node_info.get('ranks', {}).items() for w, d in v.get('workers', {}).items()
+            if (n_running := d.get('n_queue', 0) - d.get('n_pred', 0))
+        }
+        worker2running.setdefault((rank, worker_id), 0)
+        n_sample_per_worker = math.ceil((n_remain + sum(worker2running.values())) / len(worker2running))  # 剩余样本平分给各个worker
+        if n_sample_per_worker < 100 and worker2running[(rank, worker_id)] >= n_sample_per_worker:
+            return True
+
+
+def has_enough_answer_by_model(s: dict) -> bool:
+    """检查choices字段下model_name对应的答案数量是否已达到限制"""
+    if args.num_outputs_per_model and args.model_name:
+        n = 0
+        choices = s.get('choices')
+        if isinstance(choices, list):
+            for c in choices:
+                if isinstance(c, dict):
+                    if c.get('model_name') == args.model_name:
+                        n += 1
+        return n >= args.num_outputs_per_model
+
+
+def get_current_file() -> tuple[int, FileData]:
+    if args.file_schedule == 'fifo':
+        return get_current_file_fifo()
+    elif args.file_schedule == 'rr':
+        return get_current_file_rr()
+    else:
+        raise NotImplementedError
+
+
+def get_current_file_fifo() -> tuple[int, FileData]:
+    """返回当前正在推理的一个数据文件（先进先出调度策略）"""
+    i = info['i_pred']
+    try:
+        d = file_list[i]
+    except IndexError:
+        d = None
+    while d is None or is_file_all_read(d) or d.is_aborted:  # 当前数据（文件）已全部提交推理
+        if i < len(file_list) - 1:  # 还有其他数据文件
+            i += 1
+            info['i_pred'] = i
+            d = file_list[i]
+        else:
+            return i, None
+    return i, d
+
+
+def get_current_file_rr() -> tuple[int, FileData]:
+    """返回当前正在推理的一个数据文件（轮流调度策略）"""
+    i = info['i_pred']
+    f = None
+    for j in range(len(file_list)):
+        k = (i + j + 1) % len(file_list)
+        d = file_list[k]
+        if is_file_all_read(d) or d.is_aborted:  # 当前数据（文件）已全部提交推理
+            continue
+        else:
+            i = info['i_pred'] = k
+            f = d
+            break
+    return i, f
+
+
+def get_preprocess_func(preprocess_file: str = None, output_type: str = None, kwargs: dict = None):
+    if preprocess_file is None:
+        preprocess_file = args.preprocess
+    if preprocess_file not in preprocessors:
+        if preprocess_file == 'none':
+            f = lambda _s, *args, **kwargs: _s
+        else:
+            module = importlib.import_module(preprocess_file)
+            f = getattr(module, 'convert_sample_to_input_ids')
+        params = inspect.signature(f).parameters
+        preprocessors[preprocess_file] = (f, params)
+    f, params = preprocessors[preprocess_file]
+    kwargs = kwargs or {}
+    if args.chat_template_kwargs and 'chat_template_kwargs' not in kwargs:
+        kwargs['chat_template_kwargs'] = args.chat_template_kwargs
+    if output_type == 'reward':
+        kwargs.update(
+            remove_last_assistant=False,
+            add_generation_prompt=False,
+        )
+    kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return f, kwargs
+
+
+def get_postprocess_func(postprocess_file: str):
+    key = postprocess_file
+    if key not in postprocessors:
+        f = getattr(importlib.import_module(postprocess_file), 'postprocess')
+        if 'model_name' in inspect.signature(f).parameters:
+            f = partial(f, model_name=args.model_name)
+        postprocessors[key] = f
+    return postprocessors[key]
+
+
+def convert_output_to_text(output):
+    """将推理输出的token ids转换为文本"""
+    if not output:  # 推理无结果（输入超过模型最大长度？）
+        return
+    if isinstance(output, dict):  # /generate返回格式，包含text
+        info['n_token'] += output.get('meta_info', {}).get('completion_tokens', 0)
+        return output.get('text')
+    if isinstance(output, str):  # output text
+        return output
+    if isinstance(output[0], int):  # output: list[int]
+        info['n_token'] += len(output) + 1
+        return remove_stop_str(decode(output), stop).strip()
+    else:  # output: list[list[int]] | list[dict]
+        return [convert_output_to_text(o) for o in output]
+
+
+def decode(token_ids: list[int]) -> str:
+    return tokenizer.decode(
+        token_ids,
+        skip_special_tokens=not args.output_special_tokens
+    )
 
 
 def remove_stop_str(t, stop):
@@ -440,9 +859,9 @@ def remove_stop_str(t, stop):
 
 
 def set_result(i_data, i_sample, r):
-    if postprocess is not None:
-        r = postprocess(r)
     d = file_list[i_data]
+    if d.postprocess is not None:
+        r = get_postprocess_func(d.postprocess)(r)
     if d.results is None:
         d.results = []
         d.results_new = deque()
@@ -453,12 +872,15 @@ def set_result(i_data, i_sample, r):
     if args.no_order:
         d.results_new.append(r)
     d.n_pred += 1
+    d.write[1][i_sample] = asyncio.create_task(write_result_async(i_data, i_sample))
 
 
 async def write_result_async(i_data, i_sample):
     """调用线程池异步写入结果"""
     d = file_list[i_data]
     sem, i2task = d.write
+    if (d.input_path == d.output_path or args.reuse) and not d.read.done():
+        await d.read
     async with sem:
         await asyncio.get_running_loop().run_in_executor(
             None, write_result, i_data
@@ -467,38 +889,35 @@ async def write_result_async(i_data, i_sample):
 
 
 def write_result(i_data):
-    """将推理结果写入文件"""
+    """将推理结果写入jsonl文件"""
     try:
         d = file_list[i_data]
         # print('save:', d.output_path)
-
-        if d.file_type == 'json':
-            if is_file_all_done(d):  # 已全部预测完
-                os.makedirs(os.path.split(d.output_path)[0], exist_ok=True)
-                with open(d.output_path, 'w') as f:
-                    json.dump(d.results, f, ensure_ascii=False, indent=2)
-        else:  # jsonl
-            os.makedirs(os.path.split(d.output_path)[0], exist_ok=True)
-            if d.n_write == -1:
-                d.n_write = 0
-                if args.overwrite:  # 覆盖旧文件
-                    f = open(d.output_path, 'w')
-                    f.close()
-            with open(d.output_path, 'a') as f:
-                if args.no_order:
-                    while d.results_new:
-                        r = d.results_new.popleft()
-                        f.write(json.dumps(r, ensure_ascii=False) + '\n')
-                        d.n_write += 1
-                else:
-                    while d.n_write < len(d.results):
-                        i = d.n_write
-                        r = d.results[i]
-                        if r is None:
-                            break
-                        f.write(json.dumps(r, ensure_ascii=False) + '\n')
-                        d.results[i] = None  # 释放内存
-                        d.n_write += 1
+        json_kwargs = dict(
+            ensure_ascii=False,
+            escape_forward_slashes=False,  # ujson需要设置，以保持与标准库（json）一致的行为
+        )
+        os.makedirs(os.path.split(d.output_path)[0], exist_ok=True)
+        if d.n_write == -1:
+            d.n_write = 0
+            if d.overwrite or args.reuse:  # 覆盖旧文件
+                f = open(d.output_path, 'w')
+                f.close()
+        with open(d.output_path, 'a') as f:
+            if args.no_order:
+                while d.results_new:
+                    r = d.results_new.popleft()
+                    f.write(json.dumps(r, **json_kwargs) + '\n')
+                    d.n_write += 1
+            else:
+                while d.n_write < len(d.results):
+                    i = d.n_write
+                    r = d.results[i]
+                    if r is None:
+                        break
+                    f.write(json.dumps(r, **json_kwargs) + '\n')
+                    d.results[i] = None  # 释放内存
+                    d.n_write += 1
 
     except:
         traceback.print_exc()
@@ -512,7 +931,7 @@ def load_file(i_data):
         d = file_list[i_data]
         if d.file_type.startswith('json'):
             load_json_file(i_data)
-        elif d.file_type == 'dataset':
+        else:
             load_dataset(i_data)
         if args.subsample is not None:
             if args.subsample >= 1.:
@@ -536,12 +955,8 @@ def load_json_file(i_data):
     try:
         d = file_list[i_data]
         # print('read:', d.input_path)
-        if args.reuse and os.path.isfile(d.output_path):
-            file_path = d.output_path
-        else:
-            file_path = d.input_path
 
-        with open(file_path) as f:
+        with open(d.input_path) as f:
             try:
                 l = next(f)  # 读取一行，用来判断文件是json还是jsonl格式
             except StopIteration:  # 空文件
@@ -553,21 +968,36 @@ def load_json_file(i_data):
                 try:
                     _ = json.loads(l)
                 except ValueError:
+                    assert not args.reuse, 'reuse为True时，数据必须是jsonl格式！'
                     d.file_type = 'json'
                     d.samples = json.load(f)  # 整个文件是一个json对象
                 else:
-                    d.file_type = 'jsonl'
+                    d.file_type = 'jsonl'  # 每一行是一个json对象
                     d.samples = []
-                    # 已有jsonl格式的结果，跳过已预测的样本
-                    if not args.overwrite and os.path.isfile(d.output_path):
-                        n_pred = int(os.popen('wc -l ' + d.output_path).read().split()[0])
-                        d.j_pred = n_pred
-                        d.n_pred = n_pred
-                        d.n_write = n_pred
-                    for l in f:  # 每一行是一个json对象
-                        d.samples.append(json.loads(l))
-                    if d.n_write == len(d.samples):  # 已有全部样本的预测结果
-                        d.is_done = True
+                    if args.reuse:
+                        if os.path.isfile(d.output_path):  # 先读取已有的输出文件
+                            with open(d.output_path) as f1:
+                                for l in f1:
+                                    d.samples.append(json.loads(l))
+                        for i, l in enumerate(f):  # 已输出行数可能小于输入行数，需要从输入文件读取剩余行数
+                            if i >= len(d.samples):
+                                d.samples.append(json.loads(l))
+                    else:
+                        # 已有jsonl格式的结果，跳过已预测的样本
+                        n_samples, n_pred = 0, 0
+                        if not d.overwrite and os.path.isfile(d.output_path):
+                            n_samples = int(os.popen('wc -l ' + d.input_path).read().split()[0])
+                            n_pred = int(os.popen('wc -l ' + d.output_path).read().split()[0])
+                            d.j_pred = n_pred
+                            d.n_pred = n_pred
+                            d.n_write = n_pred
+                        if n_samples == n_pred > 0:  # 已全部推理完成，无需加载样本
+                            d.samples.extend(None for _ in range(n_samples))
+                        else:
+                            for i, l in enumerate(f):
+                                d.samples.append(None if i < n_pred else json.loads(l))
+                        if d.n_write == len(d.samples):  # 已有全部样本的预测结果
+                            d.is_done = True
 
     except:
         traceback.print_exc()
@@ -579,9 +1009,12 @@ def load_dataset(i_data):
     """加载datasets格式的数据文件"""
     try:
         d = file_list[i_data]
-        d.samples = datasets.load_from_disk(d.input_path)
+        if d.file_type == 'parquet':
+            d.samples = datasets.load_dataset('parquet', data_files=d.input_path)['train']
+        else:
+            d.samples = datasets.load_from_disk(d.input_path)
         # 已有jsonl格式的结果，跳过已预测的样本
-        if not args.overwrite and os.path.isfile(d.output_path):
+        if not d.overwrite and os.path.isfile(d.output_path):
             n_pred = int(os.popen('wc -l ' + d.output_path).read().split()[0])
             d.j_pred = n_pred
             d.n_pred = n_pred
@@ -594,88 +1027,136 @@ def load_dataset(i_data):
         raise
 
 
-def load_tokenizer(tokenizer_path):
+def load_tokenizer(tokenizer_path, output_type='not_cosyvoice2', chat_template=None):
     """加载processor/tokenizer"""
     global tokenizer
-    tokenizer = AutoProcessor.from_pretrained(tokenizer_path, trust_remote_code=True)
+    if output_type != 'cosyvoice2':
+        tokenizer = AutoProcessor.from_pretrained(tokenizer_path, trust_remote_code=True)
+    elif output_type in ['cosyvoice2']:
+        from utils.cosyvoice import load_cosyvoice2_tokenizer
+        tokenizer = load_cosyvoice2_tokenizer(tokenizer_path)
+    if chat_template:
+        if chat_template.endswith('.jinja'):
+            with open(chat_template, encoding='utf-8') as f:
+                chat_template = f.read()
+        tokenizer.chat_template = chat_template
 
 
-def add_file_for_prediction(data_path, output_dir=None, output_path=None, data_type='json', generation_params=None) -> List[FileData]:
-    """添加文件到推理队列"""
-    if data_type == 'json':
-        fs = add_json_file_for_prediction(data_path, output_dir, output_path)
-    else:
-        fs = add_dataset_for_prediction(data_path, output_dir)
+def add_file_for_prediction(
+    data_path, output_dir=None, output_path=None, overwrite=None, generation_params=None, **kwargs
+) -> List[FileData]:
+    """
+    添加文件到推理队列，支持下列输入格式：
+        - json/jsonl（文件）
+        - parquet（文件）
+        - datasets（目录）
 
+    Args:
+        data_path (`str`):
+            输入的文件路径，支持多个输入文件，以英文逗号分隔，或者输入目录，自动读取目录下所有支持的文件
+        output_dir (`str | None`):
+            输出的目录，会自动创建与源文件同名的结果文件，仅当未指定`output_path`时生效
+        output_path (`str | None`):
+            输出的文件路径，如果指定了`output_path`，则`output_dir`不生效
+        overwrite (`bool | None`):
+            如果输出文件已存在，是否覆盖
+        generation_params (`str | dict | None`):
+            模型生成答案的参数（如：采样温度等）
+    """
+    fs: list[FileData] = []
+    if output_path:  # 如果指定了输出文件路径，输入路径必须是单个文件或dataset目录
+        add_single_data(fs, data_path, output_path)
+    else:  # 自动扫描数据目录并判断数据格式
+        add_all_data(fs, data_path, output_dir)
+    assert len(set(f.output_path for f in fs)) == len(fs), f'文件冲突，多个输入有相同的输出路径（尝试重命名或减少输入文件）：{get_file_data_info(fs)}'
+
+    if overwrite is None:
+        overwrite = args.overwrite
     if isinstance(generation_params, str):
         generation_params = json.loads(generation_params)
 
     added = []  # 新提交的文件
     existed = []  # 之前已提交过，避免重复推理
     for f in fs:
+        f.overwrite = overwrite
+        f.output_type = kwargs.get('output_type', args.output_type)
+        for k, v in kwargs.items():
+            assert hasattr(f, k)
+            setattr(f, k, v)
+            if k == 'preprocess':  # 提前加载相关函数，如有报错及时返回调用方
+                get_preprocess_func(v, output_type=f.output_type)
+            elif k == 'postprocess' and v:
+                get_postprocess_func(v)
+
         k = (f.input_path, f.output_path)  # 根据“输入-输出”去重，因为有时即使输入路径相同，也会使用不同的preprocess，输出到不同路径
-        if k in file_path2idx:
+        if (
+            k in file_path2idx
+            and not is_file_all_done(d := file_list[file_path2idx[k]], written=True)
+            and not d.is_aborted
+        ):
             existed.append(f)
         else:
             file_path2idx[k] = len(file_list)
             f.generation_params = generation_params
             file_list.append(f)
             added.append(f)
+
+    if added:
+        print(f'已添加下列数据至推理队列：{get_file_data_info(added)}')
+    if existed:
+        print(f'下列数据已在推理队列中：{get_file_data_info(existed)}')
     return added, existed
 
 
-def add_json_file_for_prediction(data_path, output_dir=None, output_path=None) -> List[FileData]:
-    """
-    添加json/jsonl文件到推理队列
+def add_single_data(fs: list[FileData], data_path: str, output_path: str, raise_error: bool = True):
+    file_type = None
+    if os.path.isfile(data_path):
+        if data_path.endswith('.jsonl') or data_path.endswith('.json'):
+            file_type = 'json'
+        elif data_path.endswith('.parquet'):
+            file_type = 'parquet'
+        output_path = output_path.rsplit('.', 1)[0] + '.jsonl'
+    elif os.path.isdir(data_path) and os.path.isfile(os.path.join(data_path, 'dataset_info.json')):
+        file_type = 'dataset'
 
-    Args:
-        data_path (`str`):
-            输入的json/jsonl文件路径，支持多个输入文件，以英文逗号分隔，或者输入目录，自动读取目录下的所有json/jsonl文件
-        output_dir (`str | None`):
-            输出的目录，会自动创建与源文件同名的结果文件，仅当未指定`output_path`时生效
-        output_path (`str | None`):
-            输出的文件路径，如果指定了`output_path`，则`output_dir`不生效
-    """
-    if output_path:  # 如果指定了输出文件路径，输入路径必须是单个文件
-        assert os.path.isfile(data_path), f"输入文件不存在：{data_path}！"
-    fs = []
+    if file_type is not None:
+        fs.append(FileData(
+            input_path=data_path,
+            output_path=output_path,
+            file_type=file_type,
+        ))
+    elif raise_error:
+        raise ValueError(f'输入文件不存在或不支持：{data_path}')
+
+
+def add_all_data(fs: list[FileData], data_path: str, output_dir: str):
     if not os.path.isdir(data_path):  # 支持多个输入文件，以英文逗号分隔
         for f in data_path.split(','):
-            fs.append(FileData(
-                input_path=f,
-                output_path=output_path or os.path.join(output_dir, os.path.basename(f))
-            ))
-    else:  # 读取目录下的所有json文件
+            output_path = os.path.join(output_dir, os.path.basename(f))
+            add_single_data(fs, f, output_path)
+    else:  # 尝试加载目录下的所有数据（包括子目录）
         for p, q, v in os.walk(data_path):
-            for f in v:
-                if f.endswith('.json') or f.endswith('.jsonl'):
-                    apath = os.path.join(p, f)
-                    fs.append(FileData(
-                        input_path=apath,
-                        output_path=os.path.join(output_dir, apath[len(data_path):].lstrip(os.path.sep)),
-                    ))
-    return fs
+            if 'dataset_info.json' in v:  # datasets目录
+                sub_path = os.path.basename(p) if p == data_path else p[len(data_path):].lstrip(os.path.sep)  # 保留子目录结构
+                output_path = os.path.join(output_dir, sub_path) + '.jsonl'
+                add_single_data(fs, p, output_path)
+            for f in v:  # 所有目录中的文件
+                f = os.path.join(p, f)
+                output_path = os.path.join(output_dir, f[len(data_path):].lstrip(os.path.sep))
+                add_single_data(fs, f, output_path, raise_error=False)  # 自动跳过不支持的文件类型
 
 
-def add_dataset_for_prediction(data_path, output_dir=None) -> List[FileData]:
-    """添加datasets格式数据到推理队列"""
-    fs = []
-    for c in os.walk(data_path):
-        if 'dataset_info.json' in c[2]:
-            p = c[0]
-            fs.append(FileData(
-                input_path=p,
-                output_path=os.path.join(output_dir, os.path.basename(p) if p == data_path else p[len(data_path):].lstrip(os.path.sep)),
-                file_type='dataset'
-            ))
-    return fs
+def get_file_data_info(fs: list[FileData]) -> str:
+    return json.dumps(
+        [{'input_path': f.input_path, 'output_path': f.output_path, 'file_type': f.file_type} for f in fs],
+        ensure_ascii=False, escape_forward_slashes=False, indent=2
+    )
 
 
-if __name__ == "__main__":
+def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", type=str, help="Data file to predict")
-    parser.add_argument("--data_type", type=str, default='json', choices=['json', 'dataset'], help="Iutput/Output data type")
     parser.add_argument("--preprocess", type=str, default='preprocess', help="Module that provides preprocessing function")
     parser.add_argument("--postprocess", type=str, default=None, help="Module that provides postprocessing function")
     parser.add_argument("--prompt", type=str, default='Hithink', help="Prompt type")
@@ -683,7 +1164,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_path", type=str, default=None, help="Output file path")
     parser.add_argument("--output_key", type=str, default='output', help="Output key")
     parser.add_argument("--output_type", type=str, default='text', choices=OUTPUT_TYPES, help="Output type")
-    parser.add_argument("--tokenizer", type=str, required=True, help="Tokenizer path")
+    parser.add_argument("--model_name", type=str, default=None, help="Used by some postprocess methods, e.g. postprocess_append_choices.py")
+    parser.add_argument("--tokenizer", type=str, help="Tokenizer path")
     parser.add_argument("--port", type=int, default=7888, help="Server port")
     parser.add_argument("--max_length", type=int, default=None, help="Max number of tokens (input and output)")
     parser.add_argument("--max_input_tokens", type=int, default=None,
@@ -696,19 +1178,42 @@ if __name__ == "__main__":
     parser.add_argument("--no_order", action='store_true', help="Output will be written in different order than input")
     parser.add_argument("--subsample", type=float, help="proportion (0.0 - 1.0) or number (>= 1) of samples used")
     parser.add_argument("--seed", type=int, help="seed used for subsampling")
-    args = parser.parse_args()
+    parser.add_argument("--file_schedule", type=str, default='fifo', choices=['fifo', 'rr'], help="Schedule strategy for files")
+    parser.add_argument("--num_outputs_per_model", type=int, help="limit the number of outputs by model_name (by counting the existing answers in 'choices')")
+    parser.add_argument("--chat_template", type=str, help="chat template (text or .jinja file)")
+    parser.add_argument("--chat_template_kwargs", type=str, help="kwargs for apply_chat_template, e.g. enable_thinking=False")
+    parser.add_argument("--output_special_tokens", action='store_true', help="If set, use skip_special_tokens=False for tokernize.decode")
+    parser.add_argument("--tool_call_parser", type=str, help="Used to parse the model-generated tool call into OpenAI API")
+    parser.add_argument("--reasoning_parser", type=str, help="Used to parse the model-generated reasoning content into OpenAI API")
 
-    preprocess = args.preprocess
-    get_preprocess_func()
-    if args.postprocess:
-        postprocess = getattr(importlib.import_module(args.postprocess), 'postprocess')
+    global args
+    args = parser.parse_args(data_args)
 
     if args.data:
-        add_file_for_prediction(args.data, args.output_dir, args.output_path, args.data_type)
-    load_tokenizer(args.tokenizer)
+        add_file_for_prediction(args.data, args.output_dir, args.output_path, postprocess=args.postprocess)
+    if args.tokenizer:
+        load_tokenizer(args.tokenizer, args.output_type, args.chat_template)
     if args.max_length:
         tokenizer.model_max_length = args.max_length  # preprocess 代码可能会从 tokenizer 读取最大长度
     if args.stop:
+        global stop
         stop = args.stop.replace('\\n', '\n').split(',')
+    if args.chat_template_kwargs:
+        args.chat_template_kwargs = eval(f'dict({args.chat_template_kwargs})')
+    if args.tool_call_parser:
+        from vllm.entrypoints.openai.tool_parsers import ToolParserManager
+        args.tool_call_parser = ToolParserManager.get_tool_parser(args.tool_call_parser)(tokenizer)
+    if args.reasoning_parser:
+        from vllm.reasoning import ReasoningParserManager
+        args.reasoning_parser = ReasoningParserManager.get_reasoning_parser(args.reasoning_parser)(tokenizer)
 
+    is_args_loaded.set()
+
+
+if __name__ == "__main__":
+    try:
+        parse_args()
+    except:
+        traceback.print_exc()
+        info['error'] += 1
     app.run(host='0.0.0.0', port=args.port, single_process=True, access_log=False)

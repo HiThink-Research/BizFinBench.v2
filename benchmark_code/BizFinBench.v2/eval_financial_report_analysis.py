@@ -1,6 +1,5 @@
 import json
 import re
-from utils import JsonPaser
 
 def evaluation(input_path, **kwargs):
     corrects = []
@@ -23,33 +22,23 @@ def evaluation(input_path, **kwargs):
                     correct_answer = content    
             
             predict_result_str = d.get("predict_result", "")
-
-            j_paser = JsonPaser()
-            
-            predict_data = j_paser.extract_json_from_text(predict_result_str)
-            # import pdb;pdb.set_trace()
-
-            # if predict_data:
-            if predict_data and isinstance(predict_data, dict):
-                predicted_answers = predict_data["answer"] if predict_data.get("answer") else []
+            if predict_result_str:
+                predict_result_str = re.sub("[\s\S]*think>", "", predict_result_str).strip()
+                predict_result_list = re.findall("boxed\{.*?\}", predict_result_str)
+                if predict_result_list:
+                    predicted_answers = re.search("boxed\{(.*)\}", predict_result_list[-1]).group(1)
+                    predicted_answers = re.sub(r"[,，\s]", "", predicted_answers)
+                else:
+                    predicted_answers = ""
             else:
-                predicted_answers = []
+                predicted_answers = ""
+            
 
-
-            if not isinstance(predicted_answers, list):
-                predicted_answers = []
 
             correct_answers = d['choices'][0]['message']['content'][0]['text']
-            correct_answers = json.loads(correct_answers)
-            if not isinstance(correct_answers, list):
-                correct_answers = []
-
-            predicted_answers = [int(x) for x in predicted_answers]
-
-            # fix: 修改评分规则，当全符合的时候，得分为1；当部分符合的时候，分两种情况：
-            # 1.predicted_answers是correct_answers的子集，score为predicted_answers数量/correct_answers的数量 2.否则score为0
+            correct_answers = re.sub(r"[,，\s]", "", correct_answers)
             
-            if sorted(predicted_answers) == sorted(correct_answers):
+            if predicted_answers == correct_answers:
                 score = 1.0
                 d['eval_result'] = {"result": "True"}
             else:
