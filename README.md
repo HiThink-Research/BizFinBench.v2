@@ -83,7 +83,7 @@ Online result can be found [HERE](https://www.ainvest.com/llm-portfolio/)
 <img src="static/deepseek_asset_portfolio.png" alt="deepseek_asset_portfolio.png" width="60%">
 </div>
 
-## 🛠️ Usage （Not ready for now）
+## 🛠️ Usage
 ### Install requirements and download datasets
 ```sh
 pip install -r requirements.txt
