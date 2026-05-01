@@ -40,6 +40,7 @@
 * **Online Prowess:** **DeepSeek-R1** outperforms all other commercial LLMs in dynamic online tasks, achieving a total return of 13.46% with a maximum drawdown of -8%.
 
 ## 📢 News 
+- 🚀 [01/05/2026] BizFinBench.v2 has been accepted to ICML 2026.
 - 🚀 [28/01/2026] BizFinBench.v2 is ready for one-click evaluation, and we have also integrated it into [GAGE](https://github.com/HiThink-Research/GAGE) for faster evaluation.
 - 🚀 [08/01/2026] BizFinBench.v2 is out: 28,860 real-world financial questions so tough that ChatGPT-5 only scores 61.5/100. 
 
